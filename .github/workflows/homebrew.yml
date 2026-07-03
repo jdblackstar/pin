@@ -1,8 +1,9 @@
 name: homebrew
 
 on:
-  release:
-    types: [published]
+  workflow_run:
+    workflows: ["release"]
+    types: [completed]
   workflow_dispatch:
     inputs:
       tag_name:
@@ -15,9 +16,8 @@ jobs:
     name: update homebrew formula
     if: >-
       (github.event_name == 'workflow_dispatch') ||
-      (!github.event.release.prerelease &&
-       startsWith(github.event.release.tag_name, 'v') &&
-       !contains(github.event.release.tag_name, '-'))
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -28,10 +28,28 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "value=${{ inputs.tag_name }}" >> "$GITHUB_OUTPUT"
           else
-            echo "value=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+            sha="${{ github.event.workflow_run.head_sha }}"
+            tag=$(git ls-remote --tags "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" "v*" | awk -v sha="$sha" '
+              $1 == sha {
+                ref = $2
+                sub(/\^\{\}$/, "", ref)
+                sub(/^refs\/tags\//, "", ref)
+                if (ref !~ /-/) {
+                  print ref
+                  exit
+                }
+              }
+            ')
+            if [ -z "$tag" ]; then
+              echo "::notice::No non-prerelease v* tag found for ${sha}; skipping Homebrew update."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "value=$tag" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Download sha256 files
+        if: steps.tag.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -43,6 +61,7 @@ jobs:
           done
 
       - name: Read checksums
+        if: steps.tag.outputs.skip != 'true'
         id: sha
         run: |
           tag="${{ steps.tag.outputs.value }}"
@@ -53,6 +72,7 @@ jobs:
           done
 
       - name: Generate formula
+        if: steps.tag.outputs.skip != 'true'
         run: |
           tag="${{ steps.tag.outputs.value }}"
           version="${tag#v}"
@@ -92,6 +112,7 @@ jobs:
           FORMULA
 
       - name: Push to homebrew-tap
+        if: steps.tag.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |

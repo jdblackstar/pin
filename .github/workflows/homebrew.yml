@@ -1,9 +1,8 @@
 name: homebrew
 
 on:
-  workflow_run:
-    workflows: ["release"]
-    types: [completed]
+  release:
+    types: [published]
   workflow_dispatch:
     inputs:
       tag_name:
@@ -16,9 +15,9 @@ jobs:
     name: update homebrew formula
     if: >-
       (github.event_name == 'workflow_dispatch') ||
-      (github.event.workflow_run.conclusion == 'success' &&
-       startsWith(github.event.workflow_run.head_branch, 'v') &&
-       !contains(github.event.workflow_run.head_branch, '-'))
+      (!github.event.release.prerelease &&
+       startsWith(github.event.release.tag_name, 'v') &&
+       !contains(github.event.release.tag_name, '-'))
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -29,7 +28,7 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "value=${{ inputs.tag_name }}" >> "$GITHUB_OUTPUT"
           else
-            echo "value=${{ github.event.workflow_run.head_branch }}" >> "$GITHUB_OUTPUT"
+            echo "value=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Download sha256 files

@@ -543,6 +543,9 @@ func appendDefaultEnv(env []string, key, value string) []string {
 
 func writePythonScriptEntrypoint(release, entrypoint, script string) error {
 	path := filepath.Join(release, "venv", "bin", entrypoint)
+	if pathExists(path) {
+		return fmt.Errorf("entrypoint %q conflicts with an existing file in the release virtualenv", entrypoint)
+	}
 	python := filepath.Join(release, "venv", "bin", "python")
 	source := filepath.Join(release, "src")
 	wrapper := "#!/bin/sh\ncd " + shellQuote(source) + " || exit 1\nexec " + shellQuote(python) + " " + shellQuote(script) + " \"$@\"\n"

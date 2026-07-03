@@ -85,29 +85,114 @@ func writeFile(t *testing.T, path, text string) {
 	}
 }
 
+func appendFile(t *testing.T, path, text string) {
+	t.Helper()
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if _, err := file.WriteString(text); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func writeTool(t *testing.T, repo, version string) {
 	t.Helper()
-	writeFile(t, filepath.Join(repo, "setup.py"), `from setuptools import setup
+	writeFile(t, filepath.Join(repo, "pyproject.toml"), `[build-system]
+requires = []
+build-backend = "demo_backend"
+backend-path = ["."]
 
-setup(
-    name="demo-tool",
-    version="0.1.0",
-    py_modules=["demo_tool"],
-    entry_points={"console_scripts": ["demo-tool=demo_tool:main"]},
-)
+[project]
+name = "demo-tool"
+version = "0.1.0"
+
+[project.scripts]
+demo-tool = "demo_tool:main"
 `)
 	writeFile(t, filepath.Join(repo, "demo_tool.py"), `def main():
     print("demo `+version+`")
     return 0
 `)
+	writeFile(t, filepath.Join(repo, "demo_backend.py"), `import base64
+import csv
+import hashlib
+import io
+import pathlib
+import zipfile
+
+NAME = "demo_tool"
+VERSION = "0.1.0"
+DIST_INFO = f"{NAME}-{VERSION}.dist-info"
+
+
+def _hash(data):
+    digest = hashlib.sha256(data).digest()
+    return "sha256=" + base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+
+
+def _record_row(path, data):
+    return [path, _hash(data), str(len(data))]
+
+
+def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
+    wheel_name = f"{NAME}-{VERSION}-py3-none-any.whl"
+    wheel_path = pathlib.Path(wheel_directory, wheel_name)
+    files = {
+        "demo_tool.py": pathlib.Path("demo_tool.py").read_bytes(),
+        f"{DIST_INFO}/METADATA": b"Metadata-Version: 2.1\nName: demo-tool\nVersion: 0.1.0\n",
+        f"{DIST_INFO}/WHEEL": b"Wheel-Version: 1.0\nGenerator: demo-backend\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+        f"{DIST_INFO}/entry_points.txt": b"[console_scripts]\ndemo-tool = demo_tool:main\n",
+    }
+    record = io.StringIO()
+    writer = csv.writer(record, lineterminator="\n")
+    for path, data in files.items():
+        writer.writerow(_record_row(path, data))
+    writer.writerow([f"{DIST_INFO}/RECORD", "", ""])
+    files[f"{DIST_INFO}/RECORD"] = record.getvalue().encode()
+
+    with zipfile.ZipFile(wheel_path, "w", zipfile.ZIP_DEFLATED) as wheel:
+        for path, data in files.items():
+            wheel.writestr(path, data)
+    return wheel_name
+
+
+def prepare_metadata_for_build_wheel(metadata_directory, config_settings=None):
+    dist_info = pathlib.Path(metadata_directory, DIST_INFO)
+    dist_info.mkdir(parents=True, exist_ok=True)
+    dist_info.joinpath("METADATA").write_text("Metadata-Version: 2.1\nName: demo-tool\nVersion: 0.1.0\n")
+    dist_info.joinpath("WHEEL").write_text("Wheel-Version: 1.0\nGenerator: demo-backend\nRoot-Is-Purelib: true\nTag: py3-none-any\n")
+    return DIST_INFO
+`)
 	writeFile(t, filepath.Join(repo, "pin.toml"), `name = "demo-tool"
-entrypoint = "demo-tool"
 branch = "main"
 remote = "origin"
 preflight = [["python3", "-c", "from pathlib import Path; assert Path('demo_tool.py').is_file()"]]
 verify = ["demo-tool"]
 link = true
 `)
+}
+
+func writeScriptTool(t *testing.T, repo, version string) {
+	t.Helper()
+	writeFile(t, filepath.Join(repo, "automation", "demo_tool.py"), `import sys
+from pathlib import Path
+
+message = Path("data/message.txt").read_text().strip()
+print("script `+version+` " + message + " " + " ".join(sys.argv[1:]))
+`)
+	writeFile(t, filepath.Join(repo, "data", "message.txt"), "from-source\n")
+	writeFile(t, filepath.Join(repo, "pin.toml"), `name = "demo-tool"
+script = "automation/demo_tool.py"
+requirements = "requirements.txt"
+branch = "main"
+remote = "origin"
+preflight = [["python3", "-c", "from pathlib import Path; compile(Path('automation/demo_tool.py').read_text(), 'automation/demo_tool.py', 'exec')"]]
+verify = [["demo-tool", "verify"]]
+link = true
+`)
+	writeFile(t, filepath.Join(repo, "requirements.txt"), "")
 }
 
 func replacePinValue(t *testing.T, repo, key, oldValue, newValue string) {
@@ -429,6 +514,82 @@ func TestE2ECompiledBinaryUpdateWithoutStableLink(t *testing.T) {
 	}
 }
 
+func TestE2ECompiledBinaryPythonScriptLifecycle(t *testing.T) {
+	root := t.TempDir()
+	repo, _ := sourceRepo(t, root)
+	writeScriptTool(t, repo, "1")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-m", "switch to script tool")
+	git(t, repo, "push")
+	oldSHA := git(t, repo, "rev-parse", "HEAD")
+
+	result := runTool(t, runCompiledPin, root, repo, "update")
+	requireCode(t, result, 0)
+	requireContains(t, result.stdout, "updated: demo-tool "+oldSHA)
+	requireReleaseLink(t, root, "current", oldSHA)
+	output := run(t, "", filepath.Join(root, "bin", "demo-tool"), "cron")
+	if output != "script 1 from-source cron" {
+		t.Fatalf("script output = %q, want %q", output, "script 1 from-source cron")
+	}
+
+	metadataPath := filepath.Join(root, "share", "demo-tool", "releases", oldSHA, ".pin", "release.json")
+	data, err := os.ReadFile(metadataPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var metadata map[string]any
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		t.Fatal(err)
+	}
+	config, ok := metadata["config"].(map[string]any)
+	if !ok || config["script"] != "automation/demo_tool.py" {
+		t.Fatalf("metadata config script = %#v", metadata["config"])
+	}
+
+	writeScriptTool(t, repo, "2")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-m", "update script")
+	git(t, repo, "push")
+	newSHA := git(t, repo, "rev-parse", "HEAD")
+
+	result = runTool(t, runCompiledPin, root, repo, "update")
+	requireCode(t, result, 0)
+	requireContains(t, result.stdout, "updated: demo-tool "+newSHA)
+	requireReleaseLink(t, root, "current", newSHA)
+	requireReleaseLink(t, root, "previous", oldSHA)
+	output = run(t, "", filepath.Join(root, "bin", "demo-tool"), "agent")
+	if output != "script 2 from-source agent" {
+		t.Fatalf("script output = %q, want %q", output, "script 2 from-source agent")
+	}
+
+	result = runTool(t, runCompiledPin, root, repo, "rollback")
+	requireCode(t, result, 0)
+	requireReleaseLink(t, root, "current", oldSHA)
+	output = run(t, "", filepath.Join(root, "bin", "demo-tool"), "cron")
+	if output != "script 1 from-source cron" {
+		t.Fatalf("script output after rollback = %q, want %q", output, "script 1 from-source cron")
+	}
+}
+
+func TestE2ECompiledBinaryPythonScriptEntrypointVenvCollisionDoesNotActivate(t *testing.T) {
+	root := t.TempDir()
+	repo, _ := sourceRepo(t, root)
+	writeScriptTool(t, repo, "1")
+	appendFile(t, filepath.Join(repo, "pin.toml"), `entrypoint = "python"`+"\n")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-m", "collide with venv python")
+	git(t, repo, "push")
+
+	result := runTool(t, runCompiledPin, root, repo, "update")
+	requireCode(t, result, 2)
+	requireContains(t, result.stderr, `entrypoint "python" conflicts with an existing file in the release virtualenv`)
+
+	currentLink := filepath.Join(root, "share", "demo-tool", "current")
+	if _, err := os.Lstat(currentLink); !os.IsNotExist(err) {
+		t.Fatalf("current release exists after venv entrypoint collision: %s", currentLink)
+	}
+}
+
 func TestE2ECompiledBinaryPreflightFailureStopsUpdate(t *testing.T) {
 	root := t.TempDir()
 	repo, _ := sourceRepo(t, root)
@@ -454,6 +615,86 @@ func TestE2ECompiledBinaryPreflightFailureStopsUpdate(t *testing.T) {
 	}
 }
 
+func TestE2ECompiledBinaryVerifyFailureDoesNotActivateRelease(t *testing.T) {
+	root := t.TempDir()
+	repo, oldSHA := sourceRepo(t, root)
+
+	result := runTool(t, runCompiledPin, root, repo, "update")
+	requireCode(t, result, 0)
+	requireInstalledVersion(t, root, "1")
+
+	writeTool(t, repo, "2")
+	replaceInFile(
+		t,
+		filepath.Join(repo, "pin.toml"),
+		`verify = ["demo-tool"]`,
+		`verify = [["python3", "-c", "import sys; sys.stderr.write('verify boom'); raise SystemExit(9)"]]`,
+	)
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-m", "break verify")
+	newSHA := git(t, repo, "rev-parse", "HEAD")
+	git(t, repo, "push")
+
+	result = runTool(t, runCompiledPin, root, repo, "update")
+	requireCode(t, result, 2)
+	requireContains(t, result.stderr, "verify release")
+	requireContains(t, result.stderr, "verify boom")
+	requireInstalledVersion(t, root, "1")
+	requireReleaseLink(t, root, "current", oldSHA)
+
+	if _, err := os.Stat(filepath.Join(root, "share", "demo-tool", "releases", newSHA)); err != nil {
+		t.Fatalf("failed candidate release should remain inspectable: %v", err)
+	}
+}
+
+func TestE2ECompiledBinaryEntrypointCollisionDoesNotActivate(t *testing.T) {
+	root := t.TempDir()
+	repo, _ := sourceRepo(t, root)
+	stableEntrypoint := filepath.Join(root, "bin", "demo-tool")
+	writeFile(t, stableEntrypoint, "not managed by pin\n")
+
+	result := runTool(t, runCompiledPin, root, repo, "update")
+	requireCode(t, result, 2)
+	requireContains(t, result.stderr, "entrypoint path exists and is not a symlink")
+
+	currentLink := filepath.Join(root, "share", "demo-tool", "current")
+	if _, err := os.Lstat(currentLink); !os.IsNotExist(err) {
+		t.Fatalf("current release exists after entrypoint collision: %s", currentLink)
+	}
+	data, err := os.ReadFile(stableEntrypoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "not managed by pin\n" {
+		t.Fatalf("entrypoint collision file was modified: %q", string(data))
+	}
+}
+
+func TestE2ECompiledBinaryRollbackEntrypointCollisionDoesNotActivate(t *testing.T) {
+	root := t.TempDir()
+	repo, oldSHA := sourceRepo(t, root)
+
+	result := runTool(t, runCompiledPin, root, repo, "update")
+	requireCode(t, result, 0)
+	newSHA := commitToolVersion(t, repo, "2", false)
+	git(t, repo, "push")
+	result = runTool(t, runCompiledPin, root, repo, "update")
+	requireCode(t, result, 0)
+	requireInstalledVersion(t, root, "2")
+
+	stableEntrypoint := filepath.Join(root, "bin", "demo-tool")
+	if err := os.Remove(stableEntrypoint); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, stableEntrypoint, "not managed by pin\n")
+
+	result = runTool(t, runCompiledPin, root, repo, "rollback")
+	requireCode(t, result, 2)
+	requireContains(t, result.stderr, "entrypoint path exists and is not a symlink")
+	requireReleaseLink(t, root, "current", newSHA)
+	requireReleaseLink(t, root, "previous", oldSHA)
+}
+
 func TestUpdateRefusesDirtySource(t *testing.T) {
 	root := t.TempDir()
 	repo, _ := sourceRepo(t, root)
@@ -476,18 +717,30 @@ func TestConfigRejectsPathEscapingValues(t *testing.T) {
 		{"name", "../escape"},
 		{"entrypoint", "../demo-tool"},
 		{"entrypoint", "/tmp/demo-tool"},
+		{"script", "../escape.py"},
+		{"script", "/tmp/escape.py"},
+		{"requirements", "../requirements.txt"},
+		{"requirements", "/tmp/requirements.txt"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.key+"="+tc.badValue, func(t *testing.T) {
 			root := t.TempDir()
 			repo, _ := sourceRepo(t, root)
-			replacePinValue(t, repo, tc.key, "demo-tool", tc.badValue)
+			if tc.key == "entrypoint" || tc.key == "script" || tc.key == "requirements" {
+				appendFile(t, filepath.Join(repo, "pin.toml"), tc.key+` = "`+tc.badValue+`"`+"\n")
+			} else {
+				replacePinValue(t, repo, tc.key, "demo-tool", tc.badValue)
+			}
 
 			result := runTool(t, runPin, root, repo, "update")
 			if result.code != 2 {
 				t.Fatalf("update code = %d, want 2", result.code)
 			}
-			if !strings.Contains(result.stderr, "pin.toml key \""+tc.key+"\" must be a single path segment") {
+			want := "pin.toml key \"" + tc.key + "\" must be a single path segment"
+			if tc.key == "script" || tc.key == "requirements" {
+				want = "pin.toml key \"" + tc.key + "\" must"
+			}
+			if !strings.Contains(result.stderr, want) {
 				t.Fatalf("unexpected error: %s", result.stderr)
 			}
 			if _, err := os.Stat(filepath.Join(root, "escape")); !os.IsNotExist(err) {
@@ -495,6 +748,25 @@ func TestConfigRejectsPathEscapingValues(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestConfigRejectsRequirementsWithoutScript(t *testing.T) {
+	root := t.TempDir()
+	repo, _ := sourceRepo(t, root)
+	appendFile(t, filepath.Join(repo, "pin.toml"), `requirements = "requirements.txt"`+"\n")
+
+	result := runTool(t, runPin, root, repo, "update")
+	requireCode(t, result, 2)
+	requireContains(t, result.stderr, `pin.toml key "requirements" requires key "script"`)
+}
+
+func TestConfigDefaultsEntrypointToName(t *testing.T) {
+	root := t.TempDir()
+	repo, _ := sourceRepo(t, root)
+
+	result := runTool(t, runPin, root, repo, "status")
+	requireCode(t, result, 0)
+	requireContains(t, result.stdout, "entrypoint: "+filepath.Join(root, "bin", "demo-tool"))
 }
 
 func TestEntrypointEnvReplacesExistingPath(t *testing.T) {
@@ -512,6 +784,53 @@ func TestEntrypointEnvReplacesExistingPath(t *testing.T) {
 	}
 	if pathEntries != 1 {
 		t.Fatalf("PATH entries = %d, want 1", pathEntries)
+	}
+}
+
+func TestPythonInstallEnvDefaultsCachesInsideRelease(t *testing.T) {
+	t.Setenv("UV_CACHE_DIR", "")
+	t.Setenv("PIP_CACHE_DIR", "")
+	env := pythonInstallEnv("/tmp/release")
+
+	requireContains(t, strings.Join(env, "\n"), "UV_CACHE_DIR=/tmp/release/.cache/uv")
+	requireContains(t, strings.Join(env, "\n"), "PIP_CACHE_DIR=/tmp/release/.cache/pip")
+}
+
+func TestPythonInstallEnvPreservesConfiguredCaches(t *testing.T) {
+	t.Setenv("UV_CACHE_DIR", "/tmp/custom-uv")
+	t.Setenv("PIP_CACHE_DIR", "/tmp/custom-pip")
+	env := pythonInstallEnv("/tmp/release")
+	joined := strings.Join(env, "\n")
+
+	requireContains(t, joined, "UV_CACHE_DIR=/tmp/custom-uv")
+	requireContains(t, joined, "PIP_CACHE_DIR=/tmp/custom-pip")
+	if strings.Contains(joined, "UV_CACHE_DIR=/tmp/release/.cache/uv") {
+		t.Fatalf("UV_CACHE_DIR default was added despite configured cache: %s", joined)
+	}
+	if strings.Contains(joined, "PIP_CACHE_DIR=/tmp/release/.cache/pip") {
+		t.Fatalf("PIP_CACHE_DIR default was added despite configured cache: %s", joined)
+	}
+}
+
+func TestSplitCommandHandlesShellLikeQuoting(t *testing.T) {
+	got, err := splitCommand(`python3 -c "print('hello friend')" path\ with\ spaces`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"python3", "-c", "print('hello friend')", "path with spaces"}
+	if len(got) != len(want) {
+		t.Fatalf("split length = %d, want %d: %#v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("split[%d] = %q, want %q: %#v", i, got[i], want[i], got)
+		}
+	}
+}
+
+func TestSplitCommandRejectsUnfinishedQuote(t *testing.T) {
+	if _, err := splitCommand(`python3 -c "print(1)`); err == nil {
+		t.Fatal("expected unfinished quote to fail")
 	}
 }
 

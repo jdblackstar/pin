@@ -20,6 +20,43 @@ The `0.1.0` scope is intentionally narrow: Python tools only.
 That stable entrypoint is the path your cron job, launchd job, or agent should
 call.
 
+## Quickstart
+
+Create a `pin.toml` in the repo that owns your Python automation:
+
+```toml
+name = "daily-report"
+script = "scripts/daily_report.py"
+branch = "main"
+remote = "origin"
+verify = [["daily-report", "--help"]]
+```
+
+Commit and push the repo, then install it:
+
+```bash
+pin update /path/to/daily-report-repo
+```
+
+Point automation at the stable command:
+
+```cron
+15 8 * * * /Users/you/.local/bin/daily-report
+```
+
+Future updates are the same command after merging to `main`:
+
+```bash
+pin check /path/to/daily-report-repo
+pin update /path/to/daily-report-repo
+```
+
+If an update is bad, swap back to the previous release:
+
+```bash
+pin rollback daily-report
+```
+
 ## Script Example
 
 For a single Python script:
@@ -77,6 +114,11 @@ requirements = "requirements.txt"
 
 Keep this file committed. `pin` installs from the archived Git commit, not from
 untracked local files.
+
+`pin` keeps default `uv` and `pip` caches inside each release directory, so
+agent and cron environments do not need write access to user-level cache
+directories. If `UV_CACHE_DIR` or `PIP_CACHE_DIR` is already set, `pin` leaves it
+alone.
 
 ## Commands
 

@@ -544,7 +544,8 @@ func appendDefaultEnv(env []string, key, value string) []string {
 func writePythonScriptEntrypoint(release, entrypoint, script string) error {
 	path := filepath.Join(release, "venv", "bin", entrypoint)
 	python := filepath.Join(release, "venv", "bin", "python")
-	wrapper := "#!/bin/sh\nexec " + shellQuote(python) + " " + shellQuote(script) + " \"$@\"\n"
+	source := filepath.Join(release, "src")
+	wrapper := "#!/bin/sh\ncd " + shellQuote(source) + " || exit 1\nexec " + shellQuote(python) + " " + shellQuote(script) + " \"$@\"\n"
 	return os.WriteFile(path, []byte(wrapper), 0o755)
 }
 

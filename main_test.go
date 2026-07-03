@@ -571,6 +571,25 @@ func TestE2ECompiledBinaryPythonScriptLifecycle(t *testing.T) {
 	}
 }
 
+func TestE2ECompiledBinaryPythonScriptEntrypointVenvCollisionDoesNotActivate(t *testing.T) {
+	root := t.TempDir()
+	repo, _ := sourceRepo(t, root)
+	writeScriptTool(t, repo, "1")
+	appendFile(t, filepath.Join(repo, "pin.toml"), `entrypoint = "python"`+"\n")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-m", "collide with venv python")
+	git(t, repo, "push")
+
+	result := runTool(t, runCompiledPin, root, repo, "update")
+	requireCode(t, result, 2)
+	requireContains(t, result.stderr, `entrypoint "python" conflicts with an existing file in the release virtualenv`)
+
+	currentLink := filepath.Join(root, "share", "demo-tool", "current")
+	if _, err := os.Lstat(currentLink); !os.IsNotExist(err) {
+		t.Fatalf("current release exists after venv entrypoint collision: %s", currentLink)
+	}
+}
+
 func TestE2ECompiledBinaryPreflightFailureStopsUpdate(t *testing.T) {
 	root := t.TempDir()
 	repo, _ := sourceRepo(t, root)

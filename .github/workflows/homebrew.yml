@@ -1,0 +1,110 @@
+name: homebrew
+
+on:
+  workflow_run:
+    workflows: ["release"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Existing release tag to bump (for example: v0.1.0)"
+        required: true
+        type: string
+
+jobs:
+  update-formula:
+    name: update homebrew formula
+    if: >-
+      (github.event_name == 'workflow_dispatch') ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       startsWith(github.event.workflow_run.head_branch, 'v') &&
+       !contains(github.event.workflow_run.head_branch, '-'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "value=${{ inputs.tag_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${{ github.event.workflow_run.head_branch }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download sha256 files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ steps.tag.outputs.value }}"
+          for target in aarch64-apple-darwin x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            gh release download "$tag" \
+              --repo jdblackstar/pin \
+              --pattern "pin_${tag}_${target}.tar.gz.sha256"
+          done
+
+      - name: Read checksums
+        id: sha
+        run: |
+          tag="${{ steps.tag.outputs.value }}"
+          for target in aarch64-apple-darwin x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            key=$(echo "$target" | tr '-' '_')
+            hash=$(awk '{print $1}' "pin_${tag}_${target}.tar.gz.sha256")
+            echo "${key}=${hash}" >> "$GITHUB_OUTPUT"
+          done
+
+      - name: Generate formula
+        run: |
+          tag="${{ steps.tag.outputs.value }}"
+          version="${tag#v}"
+          cat > pin.rb <<FORMULA
+          class Pin < Formula
+            desc "Small release manager for local tools"
+            homepage "https://github.com/jdblackstar/pin"
+            license "MIT"
+            version "${version}"
+
+            on_macos do
+              on_arm do
+                url "https://github.com/jdblackstar/pin/releases/download/${tag}/pin_${tag}_aarch64-apple-darwin.tar.gz"
+                sha256 "${{ steps.sha.outputs.aarch64_apple_darwin }}"
+              end
+            end
+
+            on_linux do
+              on_intel do
+                url "https://github.com/jdblackstar/pin/releases/download/${tag}/pin_${tag}_x86_64-unknown-linux-musl.tar.gz"
+                sha256 "${{ steps.sha.outputs.x86_64_unknown_linux_musl }}"
+              end
+              on_arm do
+                url "https://github.com/jdblackstar/pin/releases/download/${tag}/pin_${tag}_aarch64-unknown-linux-musl.tar.gz"
+                sha256 "${{ steps.sha.outputs.aarch64_unknown_linux_musl }}"
+              end
+            end
+
+            def install
+              bin.install "pin"
+            end
+
+            test do
+              system bin/"pin", "--help"
+            end
+          end
+          FORMULA
+
+      - name: Push to homebrew-tap
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          tag="${{ steps.tag.outputs.value }}"
+          version="${tag#v}"
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/jdblackstar/homebrew-tap.git" tap
+          mkdir -p tap/Formula
+          cp pin.rb tap/Formula/pin.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/pin.rb
+          git diff --staged --quiet && echo "No changes" && exit 0
+          git commit -m "pin ${version}"
+          git push origin HEAD:main

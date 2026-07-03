@@ -452,8 +452,9 @@ func extractGitArchive(repo, sha, destination string) error {
 
 func createVenv(release string) error {
 	venvPath := filepath.Join(release, "venv")
+	env := pythonInstallEnv(release)
 	if uv, err := exec.LookPath("uv"); err == nil {
-		_, err := runCommand([]string{uv, "venv", venvPath}, release, nil)
+		_, err := runCommand([]string{uv, "venv", venvPath}, release, env)
 		return err
 	}
 
@@ -461,7 +462,7 @@ func createVenv(release string) error {
 	if err != nil {
 		return err
 	}
-	_, err = runCommand([]string{python, "-m", "venv", venvPath}, release, nil)
+	_, err = runCommand([]string{python, "-m", "venv", venvPath}, release, env)
 	return err
 }
 
@@ -474,12 +475,13 @@ func installPythonRuntime(release, source string, config config) error {
 
 func installPythonPackage(release, source string) error {
 	python := filepath.Join(release, "venv", "bin", "python")
+	env := pythonInstallEnv(release)
 	if uv, err := exec.LookPath("uv"); err == nil {
-		_, err := runCommand([]string{uv, "pip", "install", "--python", python, "."}, source, nil)
+		_, err := runCommand([]string{uv, "pip", "install", "--python", python, "."}, source, env)
 		return err
 	}
 
-	_, err := runCommand([]string{python, "-m", "pip", "install", "."}, source, nil)
+	_, err := runCommand([]string{python, "-m", "pip", "install", "."}, source, env)
 	return err
 }
 
@@ -503,13 +505,40 @@ func installPythonRequirements(release, source, requirements string) error {
 	}
 
 	python := filepath.Join(release, "venv", "bin", "python")
+	env := pythonInstallEnv(release)
 	if uv, err := exec.LookPath("uv"); err == nil {
-		_, err := runCommand([]string{uv, "pip", "install", "--python", python, "-r", requirementsPath}, source, nil)
+		_, err := runCommand([]string{uv, "pip", "install", "--python", python, "-r", requirementsPath}, source, env)
 		return err
 	}
 
-	_, err := runCommand([]string{python, "-m", "pip", "install", "-r", requirementsPath}, source, nil)
+	_, err := runCommand([]string{python, "-m", "pip", "install", "-r", requirementsPath}, source, env)
 	return err
+}
+
+func pythonInstallEnv(release string) []string {
+	env := os.Environ()
+	env = appendDefaultEnv(env, "UV_CACHE_DIR", filepath.Join(release, ".cache", "uv"))
+	env = appendDefaultEnv(env, "PIP_CACHE_DIR", filepath.Join(release, ".cache", "pip"))
+	return env
+}
+
+func appendDefaultEnv(env []string, key, value string) []string {
+	prefix := key + "="
+	updated := make([]string, 0, len(env)+1)
+	found := false
+	for _, item := range env {
+		if strings.HasPrefix(item, prefix) {
+			if strings.TrimPrefix(item, prefix) == "" {
+				continue
+			}
+			found = true
+		}
+		updated = append(updated, item)
+	}
+	if found {
+		return updated
+	}
+	return append(updated, prefix+value)
 }
 
 func writePythonScriptEntrypoint(release, entrypoint, script string) error {

@@ -765,6 +765,31 @@ func TestEntrypointEnvReplacesExistingPath(t *testing.T) {
 	}
 }
 
+func TestPythonInstallEnvDefaultsCachesInsideRelease(t *testing.T) {
+	t.Setenv("UV_CACHE_DIR", "")
+	t.Setenv("PIP_CACHE_DIR", "")
+	env := pythonInstallEnv("/tmp/release")
+
+	requireContains(t, strings.Join(env, "\n"), "UV_CACHE_DIR=/tmp/release/.cache/uv")
+	requireContains(t, strings.Join(env, "\n"), "PIP_CACHE_DIR=/tmp/release/.cache/pip")
+}
+
+func TestPythonInstallEnvPreservesConfiguredCaches(t *testing.T) {
+	t.Setenv("UV_CACHE_DIR", "/tmp/custom-uv")
+	t.Setenv("PIP_CACHE_DIR", "/tmp/custom-pip")
+	env := pythonInstallEnv("/tmp/release")
+	joined := strings.Join(env, "\n")
+
+	requireContains(t, joined, "UV_CACHE_DIR=/tmp/custom-uv")
+	requireContains(t, joined, "PIP_CACHE_DIR=/tmp/custom-pip")
+	if strings.Contains(joined, "UV_CACHE_DIR=/tmp/release/.cache/uv") {
+		t.Fatalf("UV_CACHE_DIR default was added despite configured cache: %s", joined)
+	}
+	if strings.Contains(joined, "PIP_CACHE_DIR=/tmp/release/.cache/pip") {
+		t.Fatalf("PIP_CACHE_DIR default was added despite configured cache: %s", joined)
+	}
+}
+
 func TestSplitCommandHandlesShellLikeQuoting(t *testing.T) {
 	got, err := splitCommand(`python3 -c "print('hello friend')" path\ with\ spaces`)
 	if err != nil {

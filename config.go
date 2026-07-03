@@ -13,16 +13,18 @@ import (
 const configName = "pin.toml"
 
 type config struct {
-	name       string
-	entrypoint string
-	branch     string
-	remote     string
-	preflight  [][]string
-	verify     [][]string
-	link       bool
-	sourcePath string
-	configPath string
-	raw        map[string]any
+	name         string
+	entrypoint   string
+	script       string
+	requirements string
+	branch       string
+	remote       string
+	preflight    [][]string
+	verify       [][]string
+	link         bool
+	sourcePath   string
+	configPath   string
+	raw          map[string]any
 }
 
 type pinContext struct {
@@ -131,7 +133,7 @@ func loadConfig(path string) (*config, error) {
 	if err != nil {
 		return nil, err
 	}
-	entrypoint, err := requirePathSegment(raw, "entrypoint")
+	entrypoint, err := optionalPathSegment(raw, "entrypoint", name)
 	if err != nil {
 		return nil, err
 	}
@@ -170,6 +172,18 @@ func buildConfig(raw map[string]any, name, entrypoint, branch, remote, sourcePat
 		}
 	}
 
+	script, err := optionalRelativePath(raw, "script", "")
+	if err != nil {
+		return nil, err
+	}
+	requirements, err := optionalRelativePath(raw, "requirements", "")
+	if err != nil {
+		return nil, err
+	}
+	if requirements != "" && script == "" {
+		return nil, fmt.Errorf("%s key %q requires key %q", configName, "requirements", "script")
+	}
+
 	preflight := [][]string{}
 	if value, ok := raw["preflight"]; ok {
 		preflight, err = parseCommands(value, "preflight")
@@ -192,16 +206,18 @@ func buildConfig(raw map[string]any, name, entrypoint, branch, remote, sourcePat
 	}
 
 	return &config{
-		name:       name,
-		entrypoint: entrypoint,
-		branch:     branch,
-		remote:     remote,
-		preflight:  preflight,
-		verify:     verify,
-		link:       link,
-		sourcePath: sourcePath,
-		configPath: configPath,
-		raw:        raw,
+		name:         name,
+		entrypoint:   entrypoint,
+		script:       script,
+		requirements: requirements,
+		branch:       branch,
+		remote:       remote,
+		preflight:    preflight,
+		verify:       verify,
+		link:         link,
+		sourcePath:   sourcePath,
+		configPath:   configPath,
+		raw:          raw,
 	}, nil
 }
 
@@ -221,6 +237,14 @@ func requirePathSegment(raw map[string]any, key string) (string, error) {
 	return validatePathSegment(value, fmt.Sprintf("%s key %q", configName, key))
 }
 
+func optionalPathSegment(raw map[string]any, key, fallback string) (string, error) {
+	value, err := optionalString(raw, key, fallback)
+	if err != nil {
+		return "", err
+	}
+	return validatePathSegment(value, fmt.Sprintf("%s key %q", configName, key))
+}
+
 func optionalString(raw map[string]any, key, fallback string) (string, error) {
 	value, ok := raw[key]
 	if !ok {
@@ -231,6 +255,14 @@ func optionalString(raw map[string]any, key, fallback string) (string, error) {
 		return "", fmt.Errorf("%s key %q must be a non-empty string", configName, key)
 	}
 	return text, nil
+}
+
+func optionalRelativePath(raw map[string]any, key, fallback string) (string, error) {
+	value, err := optionalString(raw, key, fallback)
+	if err != nil || value == "" {
+		return value, err
+	}
+	return validateRelativePath(value, fmt.Sprintf("%s key %q", configName, key))
 }
 
 func optionalBool(raw map[string]any, key string, fallback bool) (bool, error) {
@@ -372,6 +404,17 @@ func validatePathSegment(value, label string) (string, error) {
 		return "", fmt.Errorf("%s must be a single path segment", label)
 	}
 	return value, nil
+}
+
+func validateRelativePath(value, label string) (string, error) {
+	if filepath.IsAbs(value) {
+		return "", fmt.Errorf("%s must be a relative path", label)
+	}
+	clean := filepath.Clean(value)
+	if clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("%s must stay inside the source checkout", label)
+	}
+	return clean, nil
 }
 
 func configuredEntrypoint(ctx pinContext) string {

@@ -229,6 +229,12 @@ func updateRelease(ctx pinContext) (updateReport, error) {
 
 	err = runSteps(
 		releaseStep{"verify release", func() error { return verifyRelease(ctx, release, *config, false) }},
+		releaseStep{"check entrypoint link", func() error {
+			if !config.link {
+				return nil
+			}
+			return ensureEntrypointCanBeReplaced(ctx, ctx.stableEntrypoint())
+		}},
 		releaseStep{"activate release", func() error { return activateRelease(ctx, sha) }},
 		releaseStep{"verify active release", func() error {
 			_, err := verifyActive(ctx)
@@ -270,6 +276,12 @@ func rollbackRelease(ctx pinContext) (rollbackReport, error) {
 
 	err = runSteps(
 		releaseStep{"verify previous release", func() error { return verifyRelease(ctx, previousTarget, *config, false) }},
+		releaseStep{"check entrypoint link", func() error {
+			if !config.link {
+				return nil
+			}
+			return ensureEntrypointCanBeReplaced(ctx, ctx.stableEntrypoint())
+		}},
 		releaseStep{"activate previous release", func() error { return activateRelease(ctx, previousSHA) }},
 		releaseStep{"verify active release", func() error {
 			_, err := verifyActive(ctx)
@@ -388,7 +400,7 @@ func buildRelease(ctx pinContext, config config, sha string) (string, error) {
 			releaseStep{"create source directory", func() error { return os.Mkdir(source, 0o755) }},
 			releaseStep{"extract source", func() error { return extractGitArchive(config.sourcePath, sha, source) }},
 			releaseStep{"create virtualenv", func() error { return createVenv(final) }},
-			releaseStep{"install source", func() error { return installSource(final, source) }},
+			releaseStep{"install python runtime", func() error { return installPythonRuntime(final, source, config) }},
 			releaseStep{"write metadata", func() error { return writeReleaseMetadata(final, config, sha) }},
 		)
 	}); err != nil {
@@ -453,7 +465,14 @@ func createVenv(release string) error {
 	return err
 }
 
-func installSource(release, source string) error {
+func installPythonRuntime(release, source string, config config) error {
+	if config.script != "" {
+		return installPythonScript(release, source, config)
+	}
+	return installPythonPackage(release, source)
+}
+
+func installPythonPackage(release, source string) error {
 	python := filepath.Join(release, "venv", "bin", "python")
 	if uv, err := exec.LookPath("uv"); err == nil {
 		_, err := runCommand([]string{uv, "pip", "install", "--python", python, "."}, source, nil)
@@ -462,6 +481,49 @@ func installSource(release, source string) error {
 
 	_, err := runCommand([]string{python, "-m", "pip", "install", "."}, source, nil)
 	return err
+}
+
+func installPythonScript(release, source string, config config) error {
+	script := filepath.Join(source, config.script)
+	if err := requireFile(script, "missing script"); err != nil {
+		return err
+	}
+	if config.requirements != "" {
+		if err := installPythonRequirements(release, source, config.requirements); err != nil {
+			return err
+		}
+	}
+	return writePythonScriptEntrypoint(release, config.entrypoint, script)
+}
+
+func installPythonRequirements(release, source, requirements string) error {
+	requirementsPath := filepath.Join(source, requirements)
+	if err := requireFile(requirementsPath, "missing requirements"); err != nil {
+		return err
+	}
+
+	python := filepath.Join(release, "venv", "bin", "python")
+	if uv, err := exec.LookPath("uv"); err == nil {
+		_, err := runCommand([]string{uv, "pip", "install", "--python", python, "-r", requirementsPath}, source, nil)
+		return err
+	}
+
+	_, err := runCommand([]string{python, "-m", "pip", "install", "-r", requirementsPath}, source, nil)
+	return err
+}
+
+func writePythonScriptEntrypoint(release, entrypoint, script string) error {
+	path := filepath.Join(release, "venv", "bin", entrypoint)
+	python := filepath.Join(release, "venv", "bin", "python")
+	wrapper := "#!/bin/sh\nexec " + shellQuote(python) + " " + shellQuote(script) + " \"$@\"\n"
+	return os.WriteFile(path, []byte(wrapper), 0o755)
+}
+
+func shellQuote(value string) string {
+	if value == "" {
+		return "''"
+	}
+	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
 }
 
 func pythonCommand() (string, error) {

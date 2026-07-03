@@ -177,9 +177,12 @@ link = true
 func writeScriptTool(t *testing.T, repo, version string) {
 	t.Helper()
 	writeFile(t, filepath.Join(repo, "automation", "demo_tool.py"), `import sys
+from pathlib import Path
 
-print("script `+version+` " + " ".join(sys.argv[1:]))
+message = Path("data/message.txt").read_text().strip()
+print("script `+version+` " + message + " " + " ".join(sys.argv[1:]))
 `)
+	writeFile(t, filepath.Join(repo, "data", "message.txt"), "from-source\n")
 	writeFile(t, filepath.Join(repo, "pin.toml"), `name = "demo-tool"
 script = "automation/demo_tool.py"
 requirements = "requirements.txt"
@@ -525,8 +528,8 @@ func TestE2ECompiledBinaryPythonScriptLifecycle(t *testing.T) {
 	requireContains(t, result.stdout, "updated: demo-tool "+oldSHA)
 	requireReleaseLink(t, root, "current", oldSHA)
 	output := run(t, "", filepath.Join(root, "bin", "demo-tool"), "cron")
-	if output != "script 1 cron" {
-		t.Fatalf("script output = %q, want %q", output, "script 1 cron")
+	if output != "script 1 from-source cron" {
+		t.Fatalf("script output = %q, want %q", output, "script 1 from-source cron")
 	}
 
 	metadataPath := filepath.Join(root, "share", "demo-tool", "releases", oldSHA, ".pin", "release.json")
@@ -555,16 +558,16 @@ func TestE2ECompiledBinaryPythonScriptLifecycle(t *testing.T) {
 	requireReleaseLink(t, root, "current", newSHA)
 	requireReleaseLink(t, root, "previous", oldSHA)
 	output = run(t, "", filepath.Join(root, "bin", "demo-tool"), "agent")
-	if output != "script 2 agent" {
-		t.Fatalf("script output = %q, want %q", output, "script 2 agent")
+	if output != "script 2 from-source agent" {
+		t.Fatalf("script output = %q, want %q", output, "script 2 from-source agent")
 	}
 
 	result = runTool(t, runCompiledPin, root, repo, "rollback")
 	requireCode(t, result, 0)
 	requireReleaseLink(t, root, "current", oldSHA)
 	output = run(t, "", filepath.Join(root, "bin", "demo-tool"), "cron")
-	if output != "script 1 cron" {
-		t.Fatalf("script output after rollback = %q, want %q", output, "script 1 cron")
+	if output != "script 1 from-source cron" {
+		t.Fatalf("script output after rollback = %q, want %q", output, "script 1 from-source cron")
 	}
 }
 

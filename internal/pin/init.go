@@ -18,11 +18,11 @@ type initOptions struct {
 	entrypoint   string
 	source       string
 	requirements string
+	inject       repeatedString
 	branch       string
 	remote       string
 	preflight    repeatedString
 	verify       repeatedString
-	link         bool
 }
 
 type repeatedString []string
@@ -72,7 +72,6 @@ func (a app) commandInit(args []string) error {
 func parseInitOptions(args []string, stdout io.Writer) (initOptions, []string, error) {
 	opts := initOptions{
 		remote: "origin",
-		link:   true,
 	}
 
 	flags := flag.NewFlagSet("pin init", flag.ContinueOnError)
@@ -81,11 +80,11 @@ func parseInitOptions(args []string, stdout io.Writer) (initOptions, []string, e
 	flags.StringVar(&opts.entrypoint, "entrypoint", "", "")
 	flags.StringVar(&opts.source, "source", "", "")
 	flags.StringVar(&opts.requirements, "requirements", "", "")
+	flags.Var(&opts.inject, "inject", "")
 	flags.StringVar(&opts.branch, "branch", "", "")
 	flags.StringVar(&opts.remote, "remote", opts.remote, "")
 	flags.Var(&opts.preflight, "preflight", "")
 	flags.Var(&opts.verify, "verify", "")
-	flags.BoolVar(&opts.link, "link", opts.link, "")
 	flags.Usage = func() { printCommandUsage(stdout, "init") }
 
 	if err := flags.Parse(args); err != nil {
@@ -142,6 +141,10 @@ func renderInitConfig(opts initOptions, sourcePath string) (string, error) {
 	if requirements != "" && installSource.kind != sourceScript {
 		return "", fmt.Errorf("%s key %q requires key %q to point to a Python script", configName, "requirements", "source")
 	}
+	inject, err := validateInjectPaths(opts.inject)
+	if err != nil {
+		return "", err
+	}
 
 	branch := opts.branch
 	if branch == "" {
@@ -171,9 +174,9 @@ func renderInitConfig(opts initOptions, sourcePath string) (string, error) {
 		Remote:     remote,
 		Preflight:  preflight,
 		Verify:     verify,
-		Link:       opts.link,
 		Entrypoint: entrypoint,
 		Source:     installSource.path,
+		Inject:     inject,
 	}
 	if entrypoint == name {
 		config.Entrypoint = ""
@@ -194,11 +197,11 @@ type initConfig struct {
 	Source       string     `toml:"source"`
 	Entrypoint   string     `toml:"entrypoint,omitempty"`
 	Requirements string     `toml:"requirements,omitempty"`
+	Inject       []string   `toml:"inject,omitempty"`
 	Branch       string     `toml:"branch"`
 	Remote       string     `toml:"remote"`
 	Preflight    [][]string `toml:"preflight,omitempty"`
 	Verify       [][]string `toml:"verify"`
-	Link         bool       `toml:"link"`
 }
 
 func validateOptionalRelativeInitPath(value, key string) (string, error) {
@@ -206,6 +209,29 @@ func validateOptionalRelativeInitPath(value, key string) (string, error) {
 		return "", nil
 	}
 	return validateRelativePath(value, fmt.Sprintf("%s key %q", configName, key))
+}
+
+func validateInjectPaths(values repeatedString) ([]string, error) {
+	if len(values) == 0 {
+		return nil, nil
+	}
+	paths := make([]string, 0, len(values))
+	seen := map[string]bool{}
+	for _, value := range values {
+		path, err := validateRelativePath(value, fmt.Sprintf("%s key %q", configName, "inject"))
+		if err != nil {
+			return nil, err
+		}
+		if isReservedRuntimePath(path) {
+			return nil, fmt.Errorf("%s key %q uses reserved runtime path %q", configName, "inject", path)
+		}
+		if seen[path] {
+			return nil, fmt.Errorf("%s key %q contains duplicate path %q", configName, "inject", path)
+		}
+		seen[path] = true
+		paths = append(paths, path)
+	}
+	return paths, nil
 }
 
 func currentBranchOrDefault(sourcePath string) string {

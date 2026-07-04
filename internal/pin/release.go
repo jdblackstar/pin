@@ -16,7 +16,8 @@ import (
 const (
 	metadataDir   = ".pin"
 	metadataName  = "release.json"
-	schemaVersion = 1
+	venvDir       = ".venv"
+	schemaVersion = 2
 	checkCurrent  = "current"
 )
 
@@ -61,7 +62,6 @@ type updateReport struct {
 	gitSHA        string
 	currentLink   string
 	currentTarget string
-	entrypoint    string
 }
 
 type rollbackReport struct {
@@ -73,8 +73,8 @@ type releaseStep struct {
 	run  func() error
 }
 
-func readMetadataForTool(pinHome, pinBin, name string) (releaseMetadata, error) {
-	ctx := pinContext{name: name, pinHome: pinHome, pinBin: pinBin}
+func readMetadataForTool(pinHome, name string) (releaseMetadata, error) {
+	ctx := pinContext{name: name, pinHome: pinHome}
 	return readCurrentMetadata(ctx)
 }
 
@@ -228,23 +228,11 @@ func updateRelease(ctx pinContext) (updateReport, error) {
 	}
 
 	err = runSteps(
-		releaseStep{"verify release", func() error { return verifyRelease(ctx, release, *config, false) }},
-		releaseStep{"check entrypoint link", func() error {
-			if !config.link {
-				return nil
-			}
-			return ensureEntrypointCanBeReplaced(ctx, ctx.stableEntrypoint())
-		}},
+		releaseStep{"verify release", func() error { return verifyRelease(ctx, release, false) }},
 		releaseStep{"activate release", func() error { return activateRelease(ctx, sha) }},
 		releaseStep{"verify active release", func() error {
 			_, err := verifyActive(ctx)
 			return err
-		}},
-		releaseStep{"link entrypoint", func() error {
-			if !config.link {
-				return nil
-			}
-			return ensureStableEntrypoint(ctx)
 		}},
 	)
 	if err != nil {
@@ -259,7 +247,6 @@ func updateRelease(ctx pinContext) (updateReport, error) {
 		gitSHA:        metadata.string("git_sha"),
 		currentLink:   ctx.currentLink(),
 		currentTarget: readlink(ctx.currentLink()),
-		entrypoint:    ctx.stableEntrypoint(),
 	}, nil
 }
 
@@ -268,30 +255,14 @@ func rollbackRelease(ctx pinContext) (rollbackReport, error) {
 	if err != nil {
 		return rollbackReport{}, err
 	}
-	config, err := configFromContextOrMetadata(ctx)
-	if err != nil {
-		return rollbackReport{}, err
-	}
 	previousSHA := filepath.Base(previousTarget)
 
 	err = runSteps(
-		releaseStep{"verify previous release", func() error { return verifyRelease(ctx, previousTarget, *config, false) }},
-		releaseStep{"check entrypoint link", func() error {
-			if !config.link {
-				return nil
-			}
-			return ensureEntrypointCanBeReplaced(ctx, ctx.stableEntrypoint())
-		}},
+		releaseStep{"verify previous release", func() error { return verifyRelease(ctx, previousTarget, false) }},
 		releaseStep{"activate previous release", func() error { return activateRelease(ctx, previousSHA) }},
 		releaseStep{"verify active release", func() error {
 			_, err := verifyActive(ctx)
 			return err
-		}},
-		releaseStep{"link entrypoint", func() error {
-			if !config.link {
-				return nil
-			}
-			return ensureStableEntrypoint(ctx)
 		}},
 	)
 	if err != nil {
@@ -394,13 +365,13 @@ func buildRelease(ctx pinContext, config config, sha string) (string, error) {
 		return "", err
 	}
 
-	source := filepath.Join(final, "src")
 	if err := cleanupOnError(final, func() error {
 		return runSteps(
-			releaseStep{"create source directory", func() error { return os.Mkdir(source, 0o755) }},
-			releaseStep{"extract source", func() error { return extractGitArchive(config.sourcePath, sha, source) }},
+			releaseStep{"extract source", func() error { return extractGitArchive(config.sourcePath, sha, final) }},
+			releaseStep{"check runtime paths", func() error { return ensureRuntimePathsAvailable(final) }},
+			releaseStep{"inject files", func() error { return injectRuntimeFiles(final, config) }},
 			releaseStep{"create virtualenv", func() error { return createVenv(final) }},
-			releaseStep{"install python runtime", func() error { return installPythonRuntime(final, source, config) }},
+			releaseStep{"install python runtime", func() error { return installPythonRuntime(final, final, config) }},
 			releaseStep{"write metadata", func() error { return writeReleaseMetadata(final, config, sha) }},
 		)
 	}); err != nil {
@@ -450,8 +421,69 @@ func extractGitArchive(repo, sha, destination string) error {
 	return nil
 }
 
+func ensureRuntimePathsAvailable(release string) error {
+	for _, rel := range []string{venvDir, metadataDir, ".cache"} {
+		path := filepath.Join(release, rel)
+		_, err := os.Lstat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("reserved runtime path already exists in archived checkout: %s", path)
+	}
+	return nil
+}
+
+func injectRuntimeFiles(releaseSource string, config config) error {
+	for _, path := range config.inject {
+		source := filepath.Join(config.sourcePath, path)
+		if err := requireFile(source, "missing injected file"); err != nil {
+			return err
+		}
+		if err := ensureInjectParentDirs(releaseSource, filepath.Dir(path)); err != nil {
+			return err
+		}
+		target := filepath.Join(releaseSource, path)
+		if _, err := os.Lstat(target); err == nil {
+			return fmt.Errorf("inject target already exists in archived checkout: %s", target)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		if err := os.Symlink(source, target); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func ensureInjectParentDirs(releaseSource, relParent string) error {
+	if relParent == "." {
+		return nil
+	}
+	current := releaseSource
+	for _, part := range strings.Split(relParent, string(filepath.Separator)) {
+		current = filepath.Join(current, part)
+		info, err := os.Lstat(current)
+		if errors.Is(err, os.ErrNotExist) {
+			return os.MkdirAll(filepath.Join(releaseSource, relParent), 0o755)
+		}
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("inject parent is a symlink in archived checkout: %s", current)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("inject parent is not a directory in archived checkout: %s", current)
+		}
+	}
+	return nil
+}
+
 func createVenv(release string) error {
-	venvPath := filepath.Join(release, "venv")
+	venvPath := filepath.Join(release, venvDir)
 	env := pythonInstallEnv(release)
 	if uv, err := exec.LookPath("uv"); err == nil {
 		_, err := runCommand([]string{uv, "venv", venvPath}, release, env)
@@ -482,7 +514,7 @@ func installPythonPackage(release, source string) error {
 		return err
 	}
 
-	python := filepath.Join(release, "venv", "bin", "python")
+	python := filepath.Join(release, venvDir, "bin", "python")
 	env := pythonInstallEnv(release)
 	if uv, err := exec.LookPath("uv"); err == nil {
 		_, err := runCommand([]string{uv, "pip", "install", "--python", python, "."}, source, env)
@@ -512,7 +544,7 @@ func installPythonRequirements(release, source, requirements string) error {
 		return err
 	}
 
-	python := filepath.Join(release, "venv", "bin", "python")
+	python := filepath.Join(release, venvDir, "bin", "python")
 	env := pythonInstallEnv(release)
 	if uv, err := exec.LookPath("uv"); err == nil {
 		_, err := runCommand([]string{uv, "pip", "install", "--python", python, "-r", requirementsPath}, source, env)
@@ -550,13 +582,12 @@ func appendDefaultEnv(env []string, key, value string) []string {
 }
 
 func writePythonScriptEntrypoint(release, entrypoint, script string) error {
-	path := filepath.Join(release, "venv", "bin", entrypoint)
+	path := filepath.Join(release, venvDir, "bin", entrypoint)
 	if pathExists(path) {
 		return fmt.Errorf("entrypoint %q conflicts with an existing file in the release virtualenv", entrypoint)
 	}
-	python := filepath.Join(release, "venv", "bin", "python")
-	source := filepath.Join(release, "src")
-	wrapper := "#!/bin/sh\ncd " + shellQuote(source) + " || exit 1\nexec " + shellQuote(python) + " " + shellQuote(script) + " \"$@\"\n"
+	python := filepath.Join(release, venvDir, "bin", "python")
+	wrapper := "#!/bin/sh\ncd " + shellQuote(release) + " || exit 1\nexec " + shellQuote(python) + " " + shellQuote(script) + " \"$@\"\n"
 	return os.WriteFile(path, []byte(wrapper), 0o755)
 }
 
@@ -581,17 +612,13 @@ func verifyActive(ctx pinContext) (releaseMetadata, error) {
 	if err != nil {
 		return nil, err
 	}
-	config, err := configFromContextOrMetadata(ctx)
-	if err != nil {
-		return nil, err
-	}
-	if err := verifyRelease(ctx, release, *config, true); err != nil {
+	if err := verifyRelease(ctx, release, true); err != nil {
 		return nil, err
 	}
 	return readReleaseMetadata(release)
 }
 
-func verifyRelease(ctx pinContext, release string, config config, expectActive bool) error {
+func verifyRelease(ctx pinContext, release string, expectActive bool) error {
 	if err := requireDirectory(release, "release"); err != nil {
 		return err
 	}
@@ -599,10 +626,15 @@ func verifyRelease(ctx pinContext, release string, config config, expectActive b
 	if err != nil {
 		return err
 	}
-	entrypoint := filepath.Join(release, "venv", "bin", metadata.string("entrypoint"))
+	config, err := loadConfigFromMetadata(metadata)
+	if err != nil {
+		return err
+	}
+	entrypoint := filepath.Join(release, venvDir, "bin", metadata.string("entrypoint"))
 
 	return runSteps(
-		releaseStep{"validate metadata", func() error { return validateMetadata(ctx, release, metadata, config) }},
+		releaseStep{"validate metadata", func() error { return validateMetadata(ctx, release, metadata, *config) }},
+		releaseStep{"check injected files", func() error { return verifyInjectedFiles(release, *config) }},
 		releaseStep{"check entrypoint", func() error { return requireFile(entrypoint, "missing entrypoint") }},
 		releaseStep{"check active link", func() error {
 			if !expectActive {
@@ -611,9 +643,33 @@ func verifyRelease(ctx pinContext, release string, config config, expectActive b
 			return requireActiveTarget(ctx, release)
 		}},
 		releaseStep{"run verify commands", func() error {
-			return runConfiguredCommands(config.verify, filepath.Join(release, "src"), entrypointEnv(entrypoint))
+			return runConfiguredCommands(config.verify, release, entrypointEnv(entrypoint))
 		}},
 	)
+}
+
+func verifyInjectedFiles(release string, config config) error {
+	for _, path := range config.inject {
+		source := filepath.Join(config.sourcePath, path)
+		if err := requireFile(source, "missing injected file"); err != nil {
+			return err
+		}
+		target := filepath.Join(release, path)
+		info, err := os.Lstat(target)
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("missing injected file symlink: %s", target)
+		}
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink == 0 {
+			return fmt.Errorf("injected file target is not a symlink: %s", target)
+		}
+		if readlink(target) != source {
+			return fmt.Errorf("injected file symlink points to %s, expected %s", readlink(target), source)
+		}
+	}
+	return nil
 }
 
 func requireDirectory(path, label string) error {
@@ -741,57 +797,6 @@ func activateRelease(ctx pinContext, sha string) error {
 		}
 	}
 	return replaceSymlink(ctx.currentLink(), filepath.Join("releases", sha))
-}
-
-func ensureStableEntrypoint(ctx pinContext) error {
-	metadata, err := readCurrentMetadata(ctx)
-	if err != nil {
-		return err
-	}
-	if metadata == nil {
-		return fmt.Errorf("cannot link entrypoint without active release for %s", ctx.name)
-	}
-	entrypoint := metadata.string("entrypoint")
-	expected := filepath.Join(ctx.toolRoot(), "current", "venv", "bin", entrypoint)
-	link := filepath.Join(ctx.pinBin, entrypoint)
-
-	if err := ensureEntrypointCanBeReplaced(ctx, link); err != nil {
-		return err
-	}
-	return replaceSymlink(link, expected)
-}
-
-func ensureEntrypointCanBeReplaced(ctx pinContext, link string) error {
-	info, err := os.Lstat(link)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if info.Mode()&os.ModeSymlink == 0 {
-		return fmt.Errorf("entrypoint path exists and is not a symlink: %s", link)
-	}
-
-	resolved, err := filepath.EvalSymlinks(link)
-	if err != nil {
-		return err
-	}
-	toolRoot, err := canonicalPath(ctx.toolRoot())
-	if err != nil {
-		return err
-	}
-	if !isRelativeTo(resolved, toolRoot) {
-		return fmt.Errorf("entrypoint symlink points outside this tool: %s -> %s", link, readlink(link))
-	}
-	return nil
-}
-
-func canonicalPath(path string) (string, error) {
-	if resolved, err := filepath.EvalSymlinks(path); err == nil {
-		return resolved, nil
-	}
-	return filepath.Abs(path)
 }
 
 func replaceSymlink(path, target string) error {

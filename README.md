@@ -1,8 +1,8 @@
 # pin
 
 `pin` installs Python command-line tools from a clean Git checkout into immutable
-release directories, then exposes a stable executable path for cron jobs, agents,
-and other local automations.
+release directories, then exposes a stable current release directory for cron
+jobs, agents, and other local automations.
 
 The `0.1.0` scope is intentionally narrow: Python tools only.
 
@@ -20,13 +20,13 @@ brew install jdblackstar/tap/pin
 - verifies the checkout is clean and matches `origin/main`
 - runs optional preflight commands
 - builds a new release under `~/.local/share/<tool>/releases/<git-sha>/`
-- creates a Python virtual environment for that release
+- injects optional mutable files from the source checkout into the release
+- creates a Python virtual environment at `.venv/` inside that release
 - verifies the candidate before activation
 - atomically updates `current` and `previous` symlinks
-- links `~/.local/bin/<entrypoint>` to the active release
 
-That stable entrypoint is the path your cron job, launchd job, or agent should
-call.
+That stable `current` directory is the path your cron job, launchd job, or agent
+should use as its runtime checkout.
 
 ## Quickstart
 
@@ -44,7 +44,6 @@ source = "scripts/daily_report.py"
 branch = "main"
 remote = "origin"
 verify = [["daily-report", "--help"]]
-link = true
 ```
 
 Commit and push the repo, then install it:
@@ -53,10 +52,10 @@ Commit and push the repo, then install it:
 pin update /path/to/daily-report-repo
 ```
 
-Point automation at the stable command:
+Point automation at the stable current release:
 
 ```cron
-15 8 * * * /Users/you/.local/bin/daily-report
+15 8 * * * cd /Users/you/.local/share/daily-report/current && ./.venv/bin/daily-report
 ```
 
 Future updates are the same command after merging to `main`:
@@ -94,8 +93,9 @@ Use a directory when the repo is an installable Python package with a
 into the release venv with `uv pip install .` when `uv` is available, or
 `python -m pip install .` otherwise.
 
-`entrypoint` is the stable command name. It defaults to `name`, so set it only
-when the command you want automation to call has a different name.
+`entrypoint` is the generated command name inside `.venv/bin`. It defaults to
+`name`, so set it only when the release-local command should have a different
+name.
 
 ## Script Example
 
@@ -108,11 +108,10 @@ branch = "main"
 remote = "origin"
 preflight = [["python3", "-c", "from pathlib import Path; compile(Path('scripts/daily_report.py').read_text(), 'scripts/daily_report.py', 'exec')"]]
 verify = [["daily-report", "--help"]]
-link = true
 ```
 
-`entrypoint` defaults to `name`, so the stable command above is
-`~/.local/bin/daily-report`.
+`entrypoint` defaults to `name`, so the release-local command above is
+`.venv/bin/daily-report`.
 
 Then install or update it:
 
@@ -123,7 +122,8 @@ pin update /path/to/daily-report-repo
 After a successful update, run it from:
 
 ```bash
-~/.local/bin/daily-report
+cd ~/.local/share/daily-report/current
+./.venv/bin/daily-report
 ```
 
 ## Python Package Example
@@ -137,11 +137,10 @@ branch = "main"
 remote = "origin"
 preflight = [["uv", "run", "pytest"]]
 verify = [["staffmate", "--help"]]
-link = true
 ```
 
-`entrypoint` defaults to `name`; set it only when the package console script has
-a different name.
+`entrypoint` defaults to `name`; set it only when the release-local console
+script has a different name.
 
 ## Optional Requirements
 
@@ -159,6 +158,52 @@ untracked local files.
 agent and cron environments do not need write access to user-level cache
 directories. If `UV_CACHE_DIR` or `PIP_CACHE_DIR` is already set, `pin` leaves it
 alone.
+
+## Runtime Injection
+
+Use `inject` when a tool needs gitignored runtime files from the mutable source
+checkout:
+
+```toml
+inject = [".env"]
+```
+
+Each path must be relative to the source checkout. During `pin update`, `pin`
+creates a symlink at the same path inside the archived release checkout:
+
+```text
+~/.local/share/<tool>/releases/<git-sha>/.env -> /path/to/source/.env
+```
+
+This keeps code pinned to a Git SHA while secrets and local runtime config remain
+rotatable in one place. Rollback changes the active code release, but it does not
+restore old credentials. `pin update` and `pin verify` fail if a configured
+injected file is missing or if the release no longer contains the expected
+symlink.
+
+Multiple files can be injected:
+
+```toml
+inject = [".env", "config/local.toml"]
+```
+
+Release directories are laid out like normal checkouts of the pinned commit, with
+runtime files added alongside the repo contents:
+
+```text
+~/.local/share/<tool>/
+  current -> releases/<git-sha>
+  previous -> releases/<old-sha>
+  releases/
+    <git-sha>/
+      pyproject.toml
+      pin.toml
+      package_or_scripts/
+      .env -> /path/to/source/.env
+      config/local.toml -> /path/to/source/config/local.toml
+      .venv/
+      .pin/release.json
+```
 
 ## Commands
 
@@ -183,9 +228,9 @@ the config from the repo path or from release metadata.
 - the source checkout is dirty
 - the source branch is not the configured branch
 - `HEAD` does not match the configured remote branch
+- a configured injected file is missing
 - preflight commands fail
 - candidate verification fails
-- the stable entrypoint path already exists as an unmanaged file
 
 Failed candidate releases stay in place for inspection, but they are not made
 current.

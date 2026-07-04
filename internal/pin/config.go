@@ -158,6 +158,7 @@ func loadConfigFromMetadata(metadata releaseMetadata) (*config, error) {
 	if sourcePath == "" || !ok {
 		return nil, fmt.Errorf("active metadata for %s does not include a usable config", metadata.string("tool"))
 	}
+	raw = migrateLegacyConfig(raw)
 	name, err := validatePathSegment(metadata.string("tool"), "metadata key 'tool'")
 	if err != nil {
 		return nil, err
@@ -167,6 +168,24 @@ func loadConfigFromMetadata(metadata releaseMetadata) (*config, error) {
 		return nil, err
 	}
 	return buildConfig(raw, name, entrypoint, metadata.string("branch"), metadata.string("remote"), sourcePath, filepath.Join(sourcePath, configName))
+}
+
+func migrateLegacyConfig(raw map[string]any) map[string]any {
+	script, hasScript := raw["script"].(string)
+	if !hasScript || script == "" {
+		return raw
+	}
+	if source, ok := raw["source"].(string); ok && source != "" {
+		return raw
+	}
+	migrated := make(map[string]any, len(raw))
+	for key, value := range raw {
+		if key != "script" {
+			migrated[key] = value
+		}
+	}
+	migrated["source"] = script
+	return migrated
 }
 
 func buildConfig(raw map[string]any, name, entrypoint, branch, remote, sourcePath, configPath string) (*config, error) {

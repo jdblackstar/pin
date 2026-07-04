@@ -152,7 +152,11 @@ func renderInitConfig(opts initOptions, sourcePath string) (string, error) {
 		return "", fmt.Errorf("%s key %q must be a non-empty string", configName, "remote")
 	}
 
-	verify, err := initCommands(opts.verify, [][]string{{name, "--help"}}, "verify")
+	verifyEntrypoint := name
+	if entrypoint != "" {
+		verifyEntrypoint = entrypoint
+	}
+	verify, err := initCommands(opts.verify, [][]string{{verifyEntrypoint, "--help"}}, "verify")
 	if err != nil {
 		return "", err
 	}

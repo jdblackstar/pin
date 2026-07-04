@@ -1,4 +1,4 @@
-package main
+package pin
 
 import (
 	"fmt"
@@ -15,7 +15,7 @@ const configName = "pin.toml"
 type config struct {
 	name         string
 	entrypoint   string
-	script       string
+	source       installSource
 	requirements string
 	branch       string
 	remote       string
@@ -25,6 +25,18 @@ type config struct {
 	sourcePath   string
 	configPath   string
 	raw          map[string]any
+}
+
+type sourceKind string
+
+const (
+	sourcePackage sourceKind = "package"
+	sourceScript  sourceKind = "script"
+)
+
+type installSource struct {
+	path string
+	kind sourceKind
 }
 
 type pinContext struct {
@@ -172,16 +184,20 @@ func buildConfig(raw map[string]any, name, entrypoint, branch, remote, sourcePat
 		}
 	}
 
-	script, err := optionalRelativePath(raw, "script", "")
+	if _, ok := raw["script"]; ok {
+		return nil, fmt.Errorf("%s key %q has been replaced by key %q", configName, "script", "source")
+	}
+	source, err := parseInstallSource(raw)
 	if err != nil {
 		return nil, err
 	}
+
 	requirements, err := optionalRelativePath(raw, "requirements", "")
 	if err != nil {
 		return nil, err
 	}
-	if requirements != "" && script == "" {
-		return nil, fmt.Errorf("%s key %q requires key %q", configName, "requirements", "script")
+	if requirements != "" && source.kind != sourceScript {
+		return nil, fmt.Errorf("%s key %q requires key %q to point to a Python script", configName, "requirements", "source")
 	}
 
 	preflight := [][]string{}
@@ -208,7 +224,7 @@ func buildConfig(raw map[string]any, name, entrypoint, branch, remote, sourcePat
 	return &config{
 		name:         name,
 		entrypoint:   entrypoint,
-		script:       script,
+		source:       source,
 		requirements: requirements,
 		branch:       branch,
 		remote:       remote,
@@ -263,6 +279,25 @@ func optionalRelativePath(raw map[string]any, key, fallback string) (string, err
 		return value, err
 	}
 	return validateRelativePath(value, fmt.Sprintf("%s key %q", configName, key))
+}
+
+func parseInstallSource(raw map[string]any) (installSource, error) {
+	path, err := requireString(raw, "source")
+	if err != nil {
+		return installSource{}, err
+	}
+	return parseInstallSourceValue(path)
+}
+
+func parseInstallSourceValue(path string) (installSource, error) {
+	path, err := validateSourcePath(path, fmt.Sprintf("%s key %q", configName, "source"))
+	if err != nil {
+		return installSource{}, err
+	}
+	if isPythonScriptSource(path) {
+		return installSource{path: path, kind: sourceScript}, nil
+	}
+	return installSource{path: path, kind: sourcePackage}, nil
 }
 
 func optionalBool(raw map[string]any, key string, fallback bool) (bool, error) {
@@ -415,6 +450,21 @@ func validateRelativePath(value, label string) (string, error) {
 		return "", fmt.Errorf("%s must stay inside the source checkout", label)
 	}
 	return clean, nil
+}
+
+func validateSourcePath(value, label string) (string, error) {
+	if filepath.IsAbs(value) {
+		return "", fmt.Errorf("%s must be a relative path", label)
+	}
+	clean := filepath.Clean(value)
+	if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("%s must stay inside the source checkout", label)
+	}
+	return clean, nil
+}
+
+func isPythonScriptSource(source string) bool {
+	return strings.EqualFold(filepath.Ext(source), ".py")
 }
 
 func configuredEntrypoint(ctx pinContext) string {

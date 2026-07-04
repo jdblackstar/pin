@@ -6,6 +6,14 @@ and other local automations.
 
 The `0.1.0` scope is intentionally narrow: Python tools only.
 
+## Install pin
+
+Install the `pin` CLI with Homebrew:
+
+```bash
+brew install jdblackstar/tap/pin
+```
+
 ## What pin Does
 
 - reads a repo-local `pin.toml`
@@ -24,12 +32,19 @@ call.
 
 Create a `pin.toml` in the repo that owns your Python automation:
 
+```bash
+pin init --name daily-report --source scripts/daily_report.py --verify "daily-report --help" /path/to/daily-report-repo
+```
+
+That writes:
+
 ```toml
 name = "daily-report"
-script = "scripts/daily_report.py"
+source = "scripts/daily_report.py"
 branch = "main"
 remote = "origin"
 verify = [["daily-report", "--help"]]
+link = true
 ```
 
 Commit and push the repo, then install it:
@@ -57,13 +72,38 @@ If an update is bad, swap back to the previous release:
 pin rollback daily-report
 ```
 
+## Choosing `source`
+
+Every `pin.toml` has one install target:
+
+```toml
+source = "scripts/daily_report.py"
+```
+
+Use a Python file when the tool is a single script or a small automation repo
+that does not need packaging metadata. `pin` writes a console wrapper in the
+release venv that runs that script from the archived checkout. Add
+`requirements` when that script needs third-party dependencies.
+
+```toml
+source = "."
+```
+
+Use a directory when the repo is an installable Python package with a
+`pyproject.toml` and a console script. `pin` installs that archived directory
+into the release venv with `uv pip install .` when `uv` is available, or
+`python -m pip install .` otherwise.
+
+`entrypoint` is the stable command name. It defaults to `name`, so set it only
+when the command you want automation to call has a different name.
+
 ## Script Example
 
 For a single Python script:
 
 ```toml
 name = "daily-report"
-script = "scripts/daily_report.py"
+source = "scripts/daily_report.py"
 branch = "main"
 remote = "origin"
 preflight = [["python3", "-c", "from pathlib import Path; compile(Path('scripts/daily_report.py').read_text(), 'scripts/daily_report.py', 'exec')"]]
@@ -92,6 +132,7 @@ For a Python project with a package entrypoint in `pyproject.toml`:
 
 ```toml
 name = "staffmate"
+source = "."
 branch = "main"
 remote = "origin"
 preflight = [["uv", "run", "pytest"]]
@@ -99,16 +140,15 @@ verify = [["staffmate", "--help"]]
 link = true
 ```
 
-In package mode, `pin` runs `uv pip install .` inside the release venv.
 `entrypoint` defaults to `name`; set it only when the package console script has
 a different name.
 
 ## Optional Requirements
 
-Script mode can install a requirements file into the release venv:
+A script source can install a requirements file into the release venv:
 
 ```toml
-script = "scripts/daily_report.py"
+source = "scripts/daily_report.py"
 requirements = "requirements.txt"
 ```
 
@@ -123,6 +163,7 @@ alone.
 ## Commands
 
 ```bash
+pin init [path]
 pin status [tool_or_path]
 pin check [tool_or_path]
 pin update [tool_or_path]

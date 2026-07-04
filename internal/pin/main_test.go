@@ -1,4 +1,4 @@
-package main
+package pin
 
 import (
 	"bytes"
@@ -23,7 +23,7 @@ func runPin(t *testing.T, root string, args ...string) cliResult {
 	prepareToolEnv(t, root)
 	var stdout, stderr bytes.Buffer
 	allArgs := append([]string{"--pin-home", filepath.Join(root, "share"), "--pin-bin", filepath.Join(root, "bin")}, args...)
-	code := runCLI(allArgs, &stdout, &stderr)
+	code := RunCLI(allArgs, &stdout, &stderr)
 	return cliResult{code: code, stdout: stdout.String(), stderr: stderr.String()}
 }
 
@@ -32,7 +32,7 @@ func runCompiledPin(t *testing.T, root string, args ...string) cliResult {
 	prepareToolEnv(t, root)
 	bin := filepath.Join(root, "pin")
 	if _, err := os.Stat(bin); err != nil {
-		run(t, "", "go", "build", "-o", bin, ".")
+		run(t, "", "go", "build", "-o", bin, "../..")
 	}
 	allArgs := append([]string{"--pin-home", filepath.Join(root, "share"), "--pin-bin", filepath.Join(root, "bin")}, args...)
 	command := exec.Command(bin, allArgs...)
@@ -166,6 +166,7 @@ def prepare_metadata_for_build_wheel(metadata_directory, config_settings=None):
     return DIST_INFO
 `)
 	writeFile(t, filepath.Join(repo, "pin.toml"), `name = "demo-tool"
+source = "."
 branch = "main"
 remote = "origin"
 preflight = [["python3", "-c", "from pathlib import Path; assert Path('demo_tool.py').is_file()"]]
@@ -184,7 +185,7 @@ print("script `+version+` " + message + " " + " ".join(sys.argv[1:]))
 `)
 	writeFile(t, filepath.Join(repo, "data", "message.txt"), "from-source\n")
 	writeFile(t, filepath.Join(repo, "pin.toml"), `name = "demo-tool"
-script = "automation/demo_tool.py"
+source = "automation/demo_tool.py"
 requirements = "requirements.txt"
 branch = "main"
 remote = "origin"
@@ -322,6 +323,105 @@ func requireReleaseMetadata(t *testing.T, root, sha string) {
 
 func TestUpdateStatusVerifyAndList(t *testing.T) {
 	testUpdateStatusVerifyAndList(t, runPin)
+}
+
+func TestGlobalHelpPrintsUsageOnce(t *testing.T) {
+	result := runPin(t, t.TempDir(), "--help")
+	requireCode(t, result, 0)
+	if got := strings.Count(result.stdout, "Usage: pin "); got != 1 {
+		t.Fatalf("usage count = %d, want 1\nstdout:\n%s", got, result.stdout)
+	}
+}
+
+func TestInitCreatesDefaultConfig(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "daily-report")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	result := runPin(t, root, "init", repo)
+	requireCode(t, result, 0)
+	configPath := filepath.Join(repo, "pin.toml")
+	requireContains(t, result.stdout, "created: "+configPath)
+
+	config, err := loadConfig(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.name != "daily-report" {
+		t.Fatalf("name = %q, want daily-report", config.name)
+	}
+	if config.branch != "main" {
+		t.Fatalf("branch = %q, want main", config.branch)
+	}
+	if config.remote != "origin" {
+		t.Fatalf("remote = %q, want origin", config.remote)
+	}
+	if config.source.path != "." || config.source.kind != sourcePackage {
+		t.Fatalf("source = %#v, want package .", config.source)
+	}
+	if got := config.verify; len(got) != 1 || strings.Join(got[0], " ") != "daily-report --help" {
+		t.Fatalf("verify = %#v, want daily-report --help", got)
+	}
+	if !config.link {
+		t.Fatal("link = false, want true")
+	}
+}
+
+func TestInitAcceptsConfigFlags(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	result := runPin(
+		t,
+		root,
+		"init",
+		"--name", "daily-report",
+		"--entrypoint", "report",
+		"--source", "scripts/report.py",
+		"--requirements", "requirements.txt",
+		"--branch", "stable",
+		"--remote", "upstream",
+		"--preflight", "python3 -m py_compile scripts/report.py",
+		"--verify", "report --help",
+		"--link=false",
+		repo,
+	)
+	requireCode(t, result, 0)
+
+	config, err := loadConfig(filepath.Join(repo, "pin.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.name != "daily-report" || config.entrypoint != "report" || config.source.path != "scripts/report.py" || config.source.kind != sourceScript || config.requirements != "requirements.txt" {
+		t.Fatalf("unexpected config: %#v", config)
+	}
+	if config.branch != "stable" || config.remote != "upstream" {
+		t.Fatalf("branch/remote = %s/%s, want stable/upstream", config.branch, config.remote)
+	}
+	if got := config.preflight; len(got) != 1 || strings.Join(got[0], " ") != "python3 -m py_compile scripts/report.py" {
+		t.Fatalf("preflight = %#v", got)
+	}
+	if got := config.verify; len(got) != 1 || strings.Join(got[0], " ") != "report --help" {
+		t.Fatalf("verify = %#v", got)
+	}
+	if config.link {
+		t.Fatal("link = true, want false")
+	}
+}
+
+func TestInitRefusesToOverwriteConfig(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	writeFile(t, filepath.Join(repo, "pin.toml"), "name = \"existing\"\n")
+
+	result := runPin(t, root, "init", repo)
+	requireCode(t, result, 2)
+	requireContains(t, result.stderr, "pin.toml already exists")
 }
 
 func TestCompiledBinaryUpdateStatusVerifyAndList(t *testing.T) {
@@ -542,8 +642,8 @@ func TestE2ECompiledBinaryPythonScriptLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	config, ok := metadata["config"].(map[string]any)
-	if !ok || config["script"] != "automation/demo_tool.py" {
-		t.Fatalf("metadata config script = %#v", metadata["config"])
+	if !ok || config["source"] != "automation/demo_tool.py" {
+		t.Fatalf("metadata config source = %#v", metadata["config"])
 	}
 
 	writeScriptTool(t, repo, "2")
@@ -717,8 +817,8 @@ func TestConfigRejectsPathEscapingValues(t *testing.T) {
 		{"name", "../escape"},
 		{"entrypoint", "../demo-tool"},
 		{"entrypoint", "/tmp/demo-tool"},
-		{"script", "../escape.py"},
-		{"script", "/tmp/escape.py"},
+		{"source", "../escape.py"},
+		{"source", "/tmp/escape.py"},
 		{"requirements", "../requirements.txt"},
 		{"requirements", "/tmp/requirements.txt"},
 	}
@@ -726,10 +826,14 @@ func TestConfigRejectsPathEscapingValues(t *testing.T) {
 		t.Run(tc.key+"="+tc.badValue, func(t *testing.T) {
 			root := t.TempDir()
 			repo, _ := sourceRepo(t, root)
-			if tc.key == "entrypoint" || tc.key == "script" || tc.key == "requirements" {
+			if tc.key == "entrypoint" || tc.key == "requirements" {
 				appendFile(t, filepath.Join(repo, "pin.toml"), tc.key+` = "`+tc.badValue+`"`+"\n")
 			} else {
-				replacePinValue(t, repo, tc.key, "demo-tool", tc.badValue)
+				oldValue := "demo-tool"
+				if tc.key == "source" {
+					oldValue = "."
+				}
+				replacePinValue(t, repo, tc.key, oldValue, tc.badValue)
 			}
 
 			result := runTool(t, runPin, root, repo, "update")
@@ -737,7 +841,7 @@ func TestConfigRejectsPathEscapingValues(t *testing.T) {
 				t.Fatalf("update code = %d, want 2", result.code)
 			}
 			want := "pin.toml key \"" + tc.key + "\" must be a single path segment"
-			if tc.key == "script" || tc.key == "requirements" {
+			if tc.key == "source" || tc.key == "requirements" {
 				want = "pin.toml key \"" + tc.key + "\" must"
 			}
 			if !strings.Contains(result.stderr, want) {
@@ -750,14 +854,35 @@ func TestConfigRejectsPathEscapingValues(t *testing.T) {
 	}
 }
 
-func TestConfigRejectsRequirementsWithoutScript(t *testing.T) {
+func TestConfigRejectsRequirementsForPackageSource(t *testing.T) {
 	root := t.TempDir()
 	repo, _ := sourceRepo(t, root)
 	appendFile(t, filepath.Join(repo, "pin.toml"), `requirements = "requirements.txt"`+"\n")
 
 	result := runTool(t, runPin, root, repo, "update")
 	requireCode(t, result, 2)
-	requireContains(t, result.stderr, `pin.toml key "requirements" requires key "script"`)
+	requireContains(t, result.stderr, `pin.toml key "requirements" requires key "source" to point to a Python script`)
+}
+
+func TestConfigRejectsMissingSource(t *testing.T) {
+	root := t.TempDir()
+	repo, _ := sourceRepo(t, root)
+	replaceInFile(t, filepath.Join(repo, "pin.toml"), "source = \".\"\n", "")
+
+	result := runTool(t, runPin, root, repo, "update")
+	requireCode(t, result, 2)
+	requireContains(t, result.stderr, `pin.toml requires non-empty string key "source"`)
+}
+
+func TestConfigRejectsDeprecatedScriptKey(t *testing.T) {
+	root := t.TempDir()
+	repo, _ := sourceRepo(t, root)
+	replacePinValue(t, repo, "source", ".", "automation/demo_tool.py")
+	replaceInFile(t, filepath.Join(repo, "pin.toml"), `source = "automation/demo_tool.py"`, `script = "automation/demo_tool.py"`)
+
+	result := runTool(t, runPin, root, repo, "update")
+	requireCode(t, result, 2)
+	requireContains(t, result.stderr, `pin.toml key "script" has been replaced by key "source"`)
 }
 
 func TestConfigDefaultsEntrypointToName(t *testing.T) {

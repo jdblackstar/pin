@@ -1,4 +1,4 @@
-package main
+package pin
 
 import (
 	"bytes"
@@ -466,14 +466,22 @@ func createVenv(release string) error {
 	return err
 }
 
-func installPythonRuntime(release, source string, config config) error {
-	if config.script != "" {
-		return installPythonScript(release, source, config)
+func installPythonRuntime(release, sourceRoot string, config config) error {
+	switch config.source.kind {
+	case sourcePackage:
+		return installPythonPackage(release, filepath.Join(sourceRoot, config.source.path))
+	case sourceScript:
+		return installPythonScript(release, sourceRoot, config)
+	default:
+		return fmt.Errorf("unknown source kind %q", config.source.kind)
 	}
-	return installPythonPackage(release, source)
 }
 
 func installPythonPackage(release, source string) error {
+	if err := requireFile(filepath.Join(source, "pyproject.toml"), "missing pyproject.toml"); err != nil {
+		return err
+	}
+
 	python := filepath.Join(release, "venv", "bin", "python")
 	env := pythonInstallEnv(release)
 	if uv, err := exec.LookPath("uv"); err == nil {
@@ -485,13 +493,13 @@ func installPythonPackage(release, source string) error {
 	return err
 }
 
-func installPythonScript(release, source string, config config) error {
-	script := filepath.Join(source, config.script)
+func installPythonScript(release, sourceRoot string, config config) error {
+	script := filepath.Join(sourceRoot, config.source.path)
 	if err := requireFile(script, "missing script"); err != nil {
 		return err
 	}
 	if config.requirements != "" {
-		if err := installPythonRequirements(release, source, config.requirements); err != nil {
+		if err := installPythonRequirements(release, sourceRoot, config.requirements); err != nil {
 			return err
 		}
 	}

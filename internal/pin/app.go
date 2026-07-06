@@ -217,6 +217,16 @@ func (r statusReport) writeTo(w io.Writer) {
 
 func statusInjectedFiles(ctx pinContext, current releaseMetadata) []string {
 	if ctx.config != nil && len(ctx.config.inject) != 0 {
+		if current != nil && current.schemaVersion() == 2 {
+			sourcePath := current.string("source_path")
+			if sourcePath == "" {
+				sourcePath = ctx.config.sourcePath
+			}
+			if sourcePath == "" {
+				return ctx.config.inject
+			}
+			return resolveSourcePaths(sourcePath, ctx.config.inject)
+		}
 		return resolveInjectedPaths(ctx, ctx.config.inject)
 	}
 	if current == nil {

@@ -4,7 +4,7 @@
 release directories, then exposes a stable current release directory for cron
 jobs, agents, and other local automations.
 
-The `0.1.0` scope is intentionally narrow: Python tools only.
+The `0.1.x` scope is intentionally narrow: Python tools only.
 
 ## Install pin
 
@@ -17,7 +17,7 @@ brew install jdblackstar/tap/pin
 ## What pin Does
 
 - reads a repo-local `pin.toml`
-- verifies the checkout is clean and matches `origin/main`
+- verifies the checkout is clean and matches the configured remote branch
 - runs optional preflight commands
 - builds a new release under `~/.local/share/<tool>/releases/<git-sha>/`
 - injects optional untracked runtime paths into the release
@@ -246,5 +246,6 @@ the config from the repo path or from release metadata.
 - preflight commands fail
 - candidate verification fails
 
-Failed candidate releases stay in place for inspection, but they are not made
-current.
+Candidates that are built but fail verification or activation stay in place for
+inspection. Build-time failures are cleaned up, and failed candidates are not
+made current.

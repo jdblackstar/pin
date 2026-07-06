@@ -217,7 +217,17 @@ func (r statusReport) writeTo(w io.Writer) {
 
 func statusInjectedFiles(ctx pinContext, current releaseMetadata) []string {
 	if ctx.config != nil && len(ctx.config.inject) != 0 {
-		return resolveInjectedFiles(ctx.config.sourcePath, ctx.config.inject)
+		if current != nil && current.schemaVersion() == 2 {
+			sourcePath := current.string("source_path")
+			if sourcePath == "" {
+				sourcePath = ctx.config.sourcePath
+			}
+			if sourcePath == "" {
+				return ctx.config.inject
+			}
+			return resolveSourcePaths(sourcePath, ctx.config.inject)
+		}
+		return resolveInjectedPaths(ctx, ctx.config.inject)
 	}
 	if current == nil {
 		return nil
@@ -230,17 +240,28 @@ func statusInjectedFiles(ctx pinContext, current releaseMetadata) []string {
 	if err != nil || len(inject) == 0 {
 		return nil
 	}
-	sourcePath := current.string("source_path")
-	if sourcePath == "" {
-		return inject
+	if current.schemaVersion() == 2 {
+		sourcePath := current.string("source_path")
+		if sourcePath == "" {
+			return inject
+		}
+		return resolveSourcePaths(sourcePath, inject)
 	}
-	return resolveInjectedFiles(sourcePath, inject)
+	return resolveInjectedPaths(ctx, inject)
 }
 
-func resolveInjectedFiles(sourcePath string, inject []string) []string {
+func resolveSourcePaths(sourcePath string, paths []string) []string {
+	resolved := make([]string, 0, len(paths))
+	for _, path := range paths {
+		resolved = append(resolved, filepath.Join(sourcePath, path))
+	}
+	return resolved
+}
+
+func resolveInjectedPaths(ctx pinContext, inject []string) []string {
 	paths := make([]string, 0, len(inject))
 	for _, path := range inject {
-		paths = append(paths, filepath.Join(sourcePath, path))
+		paths = append(paths, ctx.sharedPath(path))
 	}
 	return paths
 }

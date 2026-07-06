@@ -85,6 +85,15 @@ func writeFile(t *testing.T, path, text string) {
 	}
 }
 
+func mustReadFile(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
+
 func appendFile(t *testing.T, path, text string) {
 	t.Helper()
 	file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
@@ -665,7 +674,7 @@ func TestE2ECompiledBinaryPythonScriptLifecycle(t *testing.T) {
 	}
 }
 
-func TestE2ECompiledBinaryInjectSymlinksMutableCheckoutFiles(t *testing.T) {
+func TestE2ECompiledBinaryInjectSeedsPinRuntimeFiles(t *testing.T) {
 	root := t.TempDir()
 	repo, _ := sourceRepo(t, root)
 	writeScriptTool(t, repo, "1")
@@ -692,18 +701,18 @@ print(Path(".env").read_text().strip() + " " + Path("config/local.toml").read_te
 	if err != nil {
 		t.Fatal(err)
 	}
-	sourceEnv := filepath.Join(repo, ".env")
-	if target != sourceEnv {
-		t.Fatalf("inject symlink = %s, want %s", target, sourceEnv)
+	sharedEnv := filepath.Join(root, "share", "demo-tool", "shared", ".env")
+	if target != "../../shared/.env" {
+		t.Fatalf("inject symlink = %s, want ../../shared/.env", target)
 	}
 	releaseConfig := filepath.Join(root, "share", "demo-tool", "releases", sha, "config", "local.toml")
 	target, err = os.Readlink(releaseConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
-	sourceConfig := filepath.Join(repo, "config", "local.toml")
-	if target != sourceConfig {
-		t.Fatalf("inject symlink = %s, want %s", target, sourceConfig)
+	sharedConfig := filepath.Join(root, "share", "demo-tool", "shared", "config", "local.toml")
+	if target != "../../../shared/config/local.toml" {
+		t.Fatalf("inject symlink = %s, want ../../../shared/config/local.toml", target)
 	}
 
 	output := run(t, "", activeEntrypoint(root), "first")
@@ -711,19 +720,200 @@ print(Path(".env").read_text().strip() + " " + Path("config/local.toml").read_te
 		t.Fatalf("script output = %q", output)
 	}
 
-	writeFile(t, sourceEnv, "TOKEN=beta\n")
+	writeFile(t, sharedEnv, "TOKEN=beta\n")
 	output = run(t, "", activeEntrypoint(root), "second")
 	if output != `TOKEN=beta mode = "local" second` {
 		t.Fatalf("script output after env rotation = %q", output)
 	}
+	if got := strings.TrimSpace(mustReadFile(t, filepath.Join(repo, ".env"))); got != "TOKEN=alpha" {
+		t.Fatalf("source env = %q, want TOKEN=alpha", got)
+	}
 
 	result = runTool(t, runCompiledPin, root, repo, "status")
 	requireCode(t, result, 0)
-	requireContains(t, result.stdout, "inject: "+sourceEnv)
-	requireContains(t, result.stdout, "inject: "+sourceConfig)
+	requireContains(t, result.stdout, "inject: "+sharedEnv)
+	requireContains(t, result.stdout, "inject: "+sharedConfig)
 
 	result = runTool(t, runCompiledPin, root, repo, "verify")
 	requireCode(t, result, 0)
+}
+
+func TestE2ECompiledBinaryStatusReportsSchemaTwoInjectPaths(t *testing.T) {
+	root := t.TempDir()
+	repo, _ := sourceRepo(t, root)
+	writeScriptTool(t, repo, "1")
+	writeFile(t, filepath.Join(repo, ".gitignore"), ".env\n")
+	writeFile(t, filepath.Join(repo, ".env"), "TOKEN=legacy\n")
+	appendFile(t, filepath.Join(repo, "pin.toml"), `inject = [".env"]`+"\n")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-m", "inject env")
+	git(t, repo, "push")
+	sha := git(t, repo, "rev-parse", "HEAD")
+
+	result := runTool(t, runCompiledPin, root, repo, "update")
+	requireCode(t, result, 0)
+
+	metadataPath := filepath.Join(root, "share", "demo-tool", "releases", sha, ".pin", "release.json")
+	replaceInFile(t, metadataPath, `"schema_version": 3`, `"schema_version": 2`)
+
+	result = runTool(t, runCompiledPin, root, repo, "status")
+	requireCode(t, result, 0)
+	requireContains(t, result.stdout, "inject: "+filepath.Join(repo, ".env"))
+	if strings.Contains(result.stdout, filepath.Join(root, "share", "demo-tool", "shared", ".env")) {
+		t.Fatalf("schema 2 status reported pin-home inject path:\n%s", result.stdout)
+	}
+}
+
+func TestE2ECompiledBinaryInjectRuntimeDirectories(t *testing.T) {
+	root := t.TempDir()
+	repo, _ := sourceRepo(t, root)
+	writeScriptTool(t, repo, "1")
+	writeFile(t, filepath.Join(repo, ".gitignore"), "tokens/\nlogs/\n")
+	writeFile(t, filepath.Join(repo, "tokens", "secret.txt"), "alpha\n")
+	writeFile(t, filepath.Join(repo, "tokens", "processed.txt"), "source-state\n")
+	writeFile(t, filepath.Join(repo, "logs", "seed.log"), "seed\n")
+	writeFile(t, filepath.Join(repo, "automation", "demo_tool.py"), `import os
+import sys
+from pathlib import Path
+
+tokens = Path("tokens")
+logs = Path("logs")
+secret = tokens.joinpath("secret.txt").read_text().strip()
+tmp = tokens.joinpath(".processed.tmp")
+tmp.write_text("shared-state\n")
+os.replace(tmp, tokens.joinpath("processed.txt"))
+logs.joinpath("run.log").write_text("ran " + " ".join(sys.argv[1:]))
+print(secret)
+`)
+	appendFile(t, filepath.Join(repo, "pin.toml"), `inject = ["tokens", "logs"]`+"\n")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-m", "add injected runtime paths")
+	git(t, repo, "push")
+	sha := git(t, repo, "rev-parse", "HEAD")
+
+	result := runTool(t, runCompiledPin, root, repo, "update")
+	requireCode(t, result, 0)
+	requireContains(t, result.stdout, "updated: demo-tool "+sha)
+
+	sharedTokens := filepath.Join(root, "share", "demo-tool", "shared", "tokens")
+	sharedLogs := filepath.Join(root, "share", "demo-tool", "shared", "logs")
+	releaseTokens := filepath.Join(root, "share", "demo-tool", "releases", sha, "tokens")
+	target, err := os.Readlink(releaseTokens)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target != "../../shared/tokens" {
+		t.Fatalf("shared symlink = %s, want ../../shared/tokens", target)
+	}
+	releaseLogs := filepath.Join(root, "share", "demo-tool", "releases", sha, "logs")
+	target, err = os.Readlink(releaseLogs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target != "../../shared/logs" {
+		t.Fatalf("shared symlink = %s, want ../../shared/logs", target)
+	}
+	if got := strings.TrimSpace(run(t, "", activeEntrypoint(root), "cron")); got != "alpha" {
+		t.Fatalf("script output = %q", got)
+	}
+	if got := strings.TrimSpace(mustReadFile(t, filepath.Join(sharedTokens, "processed.txt"))); got != "shared-state" {
+		t.Fatalf("shared processed = %q, want shared-state", got)
+	}
+	if got := strings.TrimSpace(mustReadFile(t, filepath.Join(repo, "tokens", "processed.txt"))); got != "source-state" {
+		t.Fatalf("source processed = %q, want source-state", got)
+	}
+	if got := strings.TrimSpace(mustReadFile(t, filepath.Join(sharedLogs, "run.log"))); got != "ran cron" {
+		t.Fatalf("shared log = %q, want ran cron", got)
+	}
+
+	result = runTool(t, runCompiledPin, root, repo, "status")
+	requireCode(t, result, 0)
+	requireContains(t, result.stdout, "inject: "+sharedTokens)
+	requireContains(t, result.stdout, "inject: "+sharedLogs)
+
+	result = runTool(t, runCompiledPin, root, repo, "verify")
+	requireCode(t, result, 0)
+}
+
+func TestE2ECompiledBinaryMissingInjectedPathStopsUpdate(t *testing.T) {
+	root := t.TempDir()
+	repo, _ := sourceRepo(t, root)
+	writeScriptTool(t, repo, "1")
+	appendFile(t, filepath.Join(repo, "pin.toml"), `inject = ["tokens"]`+"\n")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-m", "require injected tokens")
+	git(t, repo, "push")
+
+	result := runTool(t, runCompiledPin, root, repo, "update")
+	requireCode(t, result, 2)
+	requireContains(t, result.stderr, "inject runtime paths: injected path is missing")
+
+	currentLink := filepath.Join(root, "share", "demo-tool", "current")
+	if _, err := os.Lstat(currentLink); !os.IsNotExist(err) {
+		t.Fatalf("current release exists after missing injected path: %s", currentLink)
+	}
+}
+
+func TestE2ECompiledBinaryInjectRefusesTrackedArchivePath(t *testing.T) {
+	root := t.TempDir()
+	repo, _ := sourceRepo(t, root)
+	writeFile(t, filepath.Join(repo, "tokens", "readme.txt"), "tracked\n")
+	appendFile(t, filepath.Join(repo, "pin.toml"), `inject = ["tokens"]`+"\n")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-m", "track injected path")
+	git(t, repo, "push")
+
+	result := runTool(t, runCompiledPin, root, repo, "update")
+	requireCode(t, result, 2)
+	requireContains(t, result.stderr, "inject target already exists in archived checkout")
+
+	sharedTokens := filepath.Join(root, "share", "demo-tool", "shared", "tokens")
+	if _, err := os.Lstat(sharedTokens); !os.IsNotExist(err) {
+		t.Fatalf("injected path should not be seeded for tracked archive path: %s", sharedTokens)
+	}
+}
+
+func TestE2ECompiledBinaryRollbackUsesPreviousReleaseInjectedPathList(t *testing.T) {
+	root := t.TempDir()
+	repo, _ := sourceRepo(t, root)
+	writeFile(t, filepath.Join(repo, ".gitignore"), "tokens/\nlogs/\n")
+	writeFile(t, filepath.Join(repo, "tokens", "secret.txt"), "old\n")
+	appendFile(t, filepath.Join(repo, "pin.toml"), `inject = ["tokens"]`+"\n")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-m", "share tokens")
+	git(t, repo, "push")
+	oldSHA := git(t, repo, "rev-parse", "HEAD")
+
+	result := runTool(t, runCompiledPin, root, repo, "update")
+	requireCode(t, result, 0)
+	requireReleaseLink(t, root, "current", oldSHA)
+
+	writeFile(t, filepath.Join(repo, "logs", "seed.log"), "new\n")
+	replaceInFile(
+		t,
+		filepath.Join(repo, "pin.toml"),
+		`inject = ["tokens"]`,
+		`inject = ["tokens", "logs"]`,
+	)
+	git(t, repo, "add", "pin.toml", ".gitignore")
+	git(t, repo, "commit", "-m", "share logs")
+	git(t, repo, "push")
+	newSHA := git(t, repo, "rev-parse", "HEAD")
+
+	result = runTool(t, runCompiledPin, root, repo, "update")
+	requireCode(t, result, 0)
+	requireReleaseLink(t, root, "current", newSHA)
+	requireReleaseLink(t, root, "previous", oldSHA)
+
+	if err := os.RemoveAll(filepath.Join(root, "share", "demo-tool", "shared", "logs")); err != nil {
+		t.Fatal(err)
+	}
+
+	result = runTool(t, runCompiledPin, root, repo, "rollback")
+	requireCode(t, result, 0)
+	requireContains(t, result.stdout, "rolled back: demo-tool "+oldSHA)
+	requireReleaseLink(t, root, "current", oldSHA)
+	requireReleaseLink(t, root, "previous", newSHA)
 }
 
 func TestE2ECompiledBinaryRollbackUsesPreviousReleaseInjectList(t *testing.T) {
@@ -780,7 +970,7 @@ func TestE2ECompiledBinaryMissingInjectedFileStopsUpdate(t *testing.T) {
 
 	result := runTool(t, runCompiledPin, root, repo, "update")
 	requireCode(t, result, 2)
-	requireContains(t, result.stderr, "inject files: missing injected file")
+	requireContains(t, result.stderr, "inject runtime paths: injected path is missing")
 
 	currentLink := filepath.Join(root, "share", "demo-tool", "current")
 	if _, err := os.Lstat(currentLink); !os.IsNotExist(err) {
@@ -965,7 +1155,7 @@ func TestConfigRejectsPathEscapingValues(t *testing.T) {
 				want = "pin.toml key \"" + tc.key + "\" must"
 			}
 			if tc.key == "inject" && isReservedRuntimePath(filepath.Clean(tc.badValue)) {
-				want = `pin.toml key "inject" uses reserved runtime path`
+				want = `pin.toml key "` + tc.key + `" uses reserved runtime path`
 			}
 			if !strings.Contains(result.stderr, want) {
 				t.Fatalf("unexpected error: %s", result.stderr)
@@ -975,6 +1165,16 @@ func TestConfigRejectsPathEscapingValues(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestConfigRejectsOverlappingInjectedPaths(t *testing.T) {
+	root := t.TempDir()
+	repo, _ := sourceRepo(t, root)
+	appendFile(t, filepath.Join(repo, "pin.toml"), "inject = [\"tokens\", \"tokens/gmail_token.json\"]\n")
+
+	result := runTool(t, runPin, root, repo, "update")
+	requireCode(t, result, 2)
+	requireContains(t, result.stderr, `pin.toml key "inject" contains overlapping paths`)
 }
 
 func TestConfigRejectsRequirementsForPackageSource(t *testing.T) {

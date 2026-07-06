@@ -20,7 +20,7 @@ brew install jdblackstar/tap/pin
 - verifies the checkout is clean and matches `origin/main`
 - runs optional preflight commands
 - builds a new release under `~/.local/share/<tool>/releases/<git-sha>/`
-- injects optional mutable files from the source checkout into the release
+- injects optional untracked runtime paths into the release
 - creates a Python virtual environment at `.venv/` inside that release
 - verifies the candidate before activation
 - atomically updates `current` and `previous` symlinks
@@ -161,30 +161,39 @@ alone.
 
 ## Runtime Injection
 
-Use `inject` when a tool needs gitignored runtime files from the mutable source
-checkout:
+Use `inject` when a tool needs files or directories that are not tracked in Git,
+but must still appear at the checkout root when the pinned release runs:
 
 ```toml
-inject = [".env"]
+inject = ["tokens", "logs", ".env"]
 ```
 
-Each path must be relative to the source checkout. During `pin update`, `pin`
-creates a symlink at the same path inside the archived release checkout:
+Each path must be relative to the checkout root. During `pin update`, `pin`
+creates a symlink at the same path inside the archived release checkout, backed
+by stable storage under the tool's pin home:
 
 ```text
-~/.local/share/<tool>/releases/<git-sha>/.env -> /path/to/source/.env
+~/.local/share/<tool>/releases/<git-sha>/tokens -> ../../shared/tokens
+~/.local/share/<tool>/releases/<git-sha>/.env -> ../../shared/.env
 ```
 
-This keeps code pinned to a Git SHA while secrets and local runtime config remain
-rotatable in one place. Rollback changes the active code release, but it does not
-restore old credentials. `pin update` and `pin verify` fail if a configured
-injected file is missing or if the release no longer contains the expected
-symlink.
+On the first update, if the shared backing path does not exist yet and the same
+gitignored path exists in the mutable source checkout, `pin` copies it into
+`shared/` once. After that, `~/.local/share/<tool>/shared/<path>` is the
+authoritative runtime location. Future releases and rollbacks keep using the
+same injected state.
 
-Multiple files can be injected:
+This keeps code pinned to a Git SHA while secrets, tokens, logs, local databases,
+and other runtime state remain writable in one stable place. It also works for
+files that may be replaced atomically. For example, a tool can rewrite
+`tokens/processed.json` by writing a temporary file and renaming it into place,
+because the rename happens inside the shared runtime directory rather than
+replacing a release-level symlink.
+
+Multiple paths can be injected:
 
 ```toml
-inject = [".env", "config/local.toml"]
+inject = [".env", "tokens", "logs", "config/local.toml"]
 ```
 
 Release directories are laid out like normal checkouts of the pinned commit, with
@@ -194,13 +203,18 @@ runtime files added alongside the repo contents:
 ~/.local/share/<tool>/
   current -> releases/<git-sha>
   previous -> releases/<old-sha>
+  shared/
+    tokens/
+    logs/
+    .env
   releases/
     <git-sha>/
       pyproject.toml
       pin.toml
       package_or_scripts/
-      .env -> /path/to/source/.env
-      config/local.toml -> /path/to/source/config/local.toml
+      .env -> ../../shared/.env
+      tokens -> ../../shared/tokens
+      logs -> ../../shared/logs
       .venv/
       .pin/release.json
 ```
@@ -228,7 +242,7 @@ the config from the repo path or from release metadata.
 - the source checkout is dirty
 - the source branch is not the configured branch
 - `HEAD` does not match the configured remote branch
-- a configured injected file is missing
+- a configured injected path is missing from both `shared/` and the source checkout
 - preflight commands fail
 - candidate verification fails
 

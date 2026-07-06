@@ -53,6 +53,14 @@ func (ctx pinContext) releasesDir() string {
 	return filepath.Join(ctx.toolRoot(), "releases")
 }
 
+func (ctx pinContext) sharedDir() string {
+	return filepath.Join(ctx.toolRoot(), "shared")
+}
+
+func (ctx pinContext) sharedPath(rel string) string {
+	return filepath.Join(ctx.sharedDir(), rel)
+}
+
 func (ctx pinContext) currentLink() string {
 	return filepath.Join(ctx.toolRoot(), "current")
 }
@@ -319,7 +327,22 @@ func optionalRelativePathList(raw map[string]any, key string, fallback []string)
 		seen[path] = true
 		paths = append(paths, path)
 	}
+	for i, left := range paths {
+		for _, right := range paths[i+1:] {
+			if pathsOverlap(left, right) {
+				return nil, fmt.Errorf("%s key %q contains overlapping paths %q and %q", configName, key, left, right)
+			}
+		}
+	}
 	return paths, nil
+}
+
+func pathsOverlap(left, right string) bool {
+	return left == right || isPathAncestor(left, right) || isPathAncestor(right, left)
+}
+
+func isPathAncestor(parent, child string) bool {
+	return strings.HasPrefix(child, parent+string(filepath.Separator))
 }
 
 func isReservedRuntimePath(path string) bool {
@@ -502,7 +525,7 @@ func validateRelativePath(value, label string) (string, error) {
 	}
 	clean := filepath.Clean(value)
 	if clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
-		return "", fmt.Errorf("%s must stay inside the source checkout", label)
+		return "", fmt.Errorf("%s must stay inside the checkout root", label)
 	}
 	return clean, nil
 }

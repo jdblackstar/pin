@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,7 +18,7 @@ const (
 	metadataDir   = ".pin"
 	metadataName  = "release.json"
 	venvDir       = ".venv"
-	schemaVersion = 2
+	schemaVersion = 3
 	checkCurrent  = "current"
 )
 
@@ -48,6 +49,11 @@ func (m releaseMetadata) int(key string) (int, bool) {
 	default:
 		return 0, false
 	}
+}
+
+func (m releaseMetadata) schemaVersion() int {
+	version, _ := m.int("schema_version")
+	return version
 }
 
 type checkReport struct {
@@ -369,7 +375,7 @@ func buildRelease(ctx pinContext, config config, sha string) (string, error) {
 		return runSteps(
 			releaseStep{"extract source", func() error { return extractGitArchive(config.sourcePath, sha, final) }},
 			releaseStep{"check runtime paths", func() error { return ensureRuntimePathsAvailable(final) }},
-			releaseStep{"inject files", func() error { return injectRuntimeFiles(final, config) }},
+			releaseStep{"inject runtime paths", func() error { return injectRuntimePaths(ctx, final, config) }},
 			releaseStep{"create virtualenv", func() error { return createVenv(final) }},
 			releaseStep{"install python runtime", func() error { return installPythonRuntime(final, final, config) }},
 			releaseStep{"write metadata", func() error { return writeReleaseMetadata(final, config, sha) }},
@@ -436,24 +442,36 @@ func ensureRuntimePathsAvailable(release string) error {
 	return nil
 }
 
-func injectRuntimeFiles(releaseSource string, config config) error {
+func injectRuntimePaths(ctx pinContext, releaseSource string, config config) error {
 	for _, path := range config.inject {
-		source := filepath.Join(config.sourcePath, path)
-		if err := requireFile(source, "missing injected file"); err != nil {
+		backing := ctx.sharedPath(path)
+		if err := ensureInjectTargetAvailable(releaseSource, path); err != nil {
 			return err
 		}
-		if err := ensureInjectParentDirs(releaseSource, filepath.Dir(path)); err != nil {
+		if err := ensureInjectedBackingPath(backing, filepath.Join(config.sourcePath, path)); err != nil {
 			return err
 		}
 		target := filepath.Join(releaseSource, path)
-		if _, err := os.Lstat(target); err == nil {
-			return fmt.Errorf("inject target already exists in archived checkout: %s", target)
-		} else if !errors.Is(err, os.ErrNotExist) {
+		linkTarget, err := relativeSymlinkTarget(target, backing)
+		if err != nil {
 			return err
 		}
-		if err := os.Symlink(source, target); err != nil {
+		if err := os.Symlink(linkTarget, target); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func ensureInjectTargetAvailable(releaseSource, rel string) error {
+	if err := ensureInjectParentDirs(releaseSource, filepath.Dir(rel)); err != nil {
+		return err
+	}
+	target := filepath.Join(releaseSource, rel)
+	if _, err := os.Lstat(target); err == nil {
+		return fmt.Errorf("inject target already exists in archived checkout: %s", target)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
 	}
 	return nil
 }
@@ -480,6 +498,105 @@ func ensureInjectParentDirs(releaseSource, relParent string) error {
 		}
 	}
 	return nil
+}
+
+func ensureInjectedBackingPath(backing, source string) error {
+	if _, err := os.Lstat(backing); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	sourceInfo, err := os.Lstat(source)
+	if errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("injected path is missing; create %s or seed it at %s", backing, source)
+	}
+	if err != nil {
+		return err
+	}
+	if sourceInfo.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("injected source path is a symlink: %s", source)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(backing), 0o755); err != nil {
+		return err
+	}
+	tmp := filepath.Join(filepath.Dir(backing), fmt.Sprintf(".%s.%d.tmp", filepath.Base(backing), os.Getpid()))
+	_ = os.RemoveAll(tmp)
+	if sourceInfo.IsDir() {
+		if err := copyDirectory(tmp, source); err != nil {
+			_ = os.RemoveAll(tmp)
+			return err
+		}
+	} else {
+		if err := copyRegularFile(tmp, source, sourceInfo.Mode().Perm()); err != nil {
+			_ = os.RemoveAll(tmp)
+			return err
+		}
+	}
+	if err := os.Rename(tmp, backing); err != nil {
+		_ = os.RemoveAll(tmp)
+		return err
+	}
+	return nil
+}
+
+func copyDirectory(destination, source string) error {
+	return filepath.WalkDir(source, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("injected source path contains symlink: %s", path)
+		}
+		rel, err := filepath.Rel(source, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(destination, rel)
+		if entry.IsDir() {
+			return os.MkdirAll(target, info.Mode().Perm())
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("injected source path contains unsupported file: %s", path)
+		}
+		return copyRegularFile(target, path, info.Mode().Perm())
+	})
+}
+
+func copyRegularFile(destination, source string, mode os.FileMode) error {
+	input, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer input.Close()
+
+	output, err := os.OpenFile(destination, os.O_CREATE|os.O_EXCL|os.O_WRONLY, mode)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(output, input)
+	closeErr := output.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	return closeErr
+}
+
+func relativeSymlinkTarget(link, target string) (string, error) {
+	linkDir, err := filepath.Abs(filepath.Dir(link))
+	if err != nil {
+		return "", err
+	}
+	targetAbs, err := filepath.Abs(target)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Rel(linkDir, targetAbs)
 }
 
 func createVenv(release string) error {
@@ -634,7 +751,7 @@ func verifyRelease(ctx pinContext, release string, expectActive bool) error {
 
 	return runSteps(
 		releaseStep{"validate metadata", func() error { return validateMetadata(ctx, release, metadata, *config) }},
-		releaseStep{"check injected files", func() error { return verifyInjectedFiles(release, *config) }},
+		releaseStep{"check injected paths", func() error { return verifyInjectedPaths(ctx, release, metadata, *config) }},
 		releaseStep{"check entrypoint", func() error { return requireFile(entrypoint, "missing entrypoint") }},
 		releaseStep{"check active link", func() error {
 			if !expectActive {
@@ -648,26 +765,59 @@ func verifyRelease(ctx pinContext, release string, expectActive bool) error {
 	)
 }
 
-func verifyInjectedFiles(release string, config config) error {
+func verifyInjectedPaths(ctx pinContext, release string, metadata releaseMetadata, config config) error {
+	if metadata.schemaVersion() == 2 {
+		return verifyLegacyInjectedFiles(release, config)
+	}
+	return verifyInjectedRuntimePaths(ctx, release, config)
+}
+
+func verifyInjectedRuntimePaths(ctx pinContext, release string, config config) error {
+	for _, path := range config.inject {
+		backing := ctx.sharedPath(path)
+		if _, err := os.Stat(backing); errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("missing injected path: %s", backing)
+		} else if err != nil {
+			return err
+		}
+		target := filepath.Join(release, path)
+		linkTarget, err := relativeSymlinkTarget(target, backing)
+		if err != nil {
+			return err
+		}
+		if err := verifyReleaseSymlink(target, linkTarget, "injected path"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func verifyLegacyInjectedFiles(release string, config config) error {
 	for _, path := range config.inject {
 		source := filepath.Join(config.sourcePath, path)
 		if err := requireFile(source, "missing injected file"); err != nil {
 			return err
 		}
-		target := filepath.Join(release, path)
-		info, err := os.Lstat(target)
-		if errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("missing injected file symlink: %s", target)
-		}
-		if err != nil {
+		if err := verifyReleaseSymlink(filepath.Join(release, path), source, "injected file"); err != nil {
 			return err
 		}
-		if info.Mode()&os.ModeSymlink == 0 {
-			return fmt.Errorf("injected file target is not a symlink: %s", target)
-		}
-		if readlink(target) != source {
-			return fmt.Errorf("injected file symlink points to %s, expected %s", readlink(target), source)
-		}
+	}
+	return nil
+}
+
+func verifyReleaseSymlink(target, expected, label string) error {
+	info, err := os.Lstat(target)
+	if errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("missing %s symlink: %s", label, target)
+	}
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		return fmt.Errorf("%s target is not a symlink: %s", label, target)
+	}
+	if readlink(target) != expected {
+		return fmt.Errorf("%s symlink points to %s, expected %s", label, readlink(target), expected)
 	}
 	return nil
 }
@@ -742,7 +892,8 @@ func runConfiguredCommands(commands [][]string, cwd string, env []string) error 
 }
 
 func validateMetadata(ctx pinContext, release string, metadata releaseMetadata, config config) error {
-	if version, ok := metadata.int("schema_version"); !ok || version != schemaVersion {
+	version, ok := metadata.int("schema_version")
+	if !ok || version != 2 && version != schemaVersion {
 		return fmt.Errorf("unsupported metadata schema: %v", metadata["schema_version"])
 	}
 	for _, key := range []string{"tool", "entrypoint", "git_sha", "source_path", "branch", "remote", "installed_at", "release_path"} {

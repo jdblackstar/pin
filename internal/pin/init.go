@@ -212,24 +212,35 @@ func validateOptionalRelativeInitPath(value, key string) (string, error) {
 }
 
 func validateInjectPaths(values repeatedString) ([]string, error) {
+	return validateRuntimePaths(values, "inject")
+}
+
+func validateRuntimePaths(values repeatedString, key string) ([]string, error) {
 	if len(values) == 0 {
 		return nil, nil
 	}
 	paths := make([]string, 0, len(values))
 	seen := map[string]bool{}
 	for _, value := range values {
-		path, err := validateRelativePath(value, fmt.Sprintf("%s key %q", configName, "inject"))
+		path, err := validateRelativePath(value, fmt.Sprintf("%s key %q", configName, key))
 		if err != nil {
 			return nil, err
 		}
 		if isReservedRuntimePath(path) {
-			return nil, fmt.Errorf("%s key %q uses reserved runtime path %q", configName, "inject", path)
+			return nil, fmt.Errorf("%s key %q uses reserved runtime path %q", configName, key, path)
 		}
 		if seen[path] {
-			return nil, fmt.Errorf("%s key %q contains duplicate path %q", configName, "inject", path)
+			return nil, fmt.Errorf("%s key %q contains duplicate path %q", configName, key, path)
 		}
 		seen[path] = true
 		paths = append(paths, path)
+	}
+	for i, left := range paths {
+		for _, right := range paths[i+1:] {
+			if pathsOverlap(left, right) {
+				return nil, fmt.Errorf("%s key %q contains overlapping paths %q and %q", configName, key, left, right)
+			}
+		}
 	}
 	return paths, nil
 }

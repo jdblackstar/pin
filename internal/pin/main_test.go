@@ -738,6 +738,32 @@ print(Path(".env").read_text().strip() + " " + Path("config/local.toml").read_te
 	requireCode(t, result, 0)
 }
 
+func TestE2ECompiledBinaryStatusReportsSchemaTwoInjectPaths(t *testing.T) {
+	root := t.TempDir()
+	repo, _ := sourceRepo(t, root)
+	writeScriptTool(t, repo, "1")
+	writeFile(t, filepath.Join(repo, ".gitignore"), ".env\n")
+	writeFile(t, filepath.Join(repo, ".env"), "TOKEN=legacy\n")
+	appendFile(t, filepath.Join(repo, "pin.toml"), `inject = [".env"]`+"\n")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-m", "inject env")
+	git(t, repo, "push")
+	sha := git(t, repo, "rev-parse", "HEAD")
+
+	result := runTool(t, runCompiledPin, root, repo, "update")
+	requireCode(t, result, 0)
+
+	metadataPath := filepath.Join(root, "share", "demo-tool", "releases", sha, ".pin", "release.json")
+	replaceInFile(t, metadataPath, `"schema_version": 3`, `"schema_version": 2`)
+
+	result = runTool(t, runCompiledPin, root, repo, "status")
+	requireCode(t, result, 0)
+	requireContains(t, result.stdout, "inject: "+filepath.Join(repo, ".env"))
+	if strings.Contains(result.stdout, filepath.Join(root, "share", "demo-tool", "shared", ".env")) {
+		t.Fatalf("schema 2 status reported pin-home inject path:\n%s", result.stdout)
+	}
+}
+
 func TestE2ECompiledBinaryInjectRuntimeDirectories(t *testing.T) {
 	root := t.TempDir()
 	repo, _ := sourceRepo(t, root)

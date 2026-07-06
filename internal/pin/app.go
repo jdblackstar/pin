@@ -16,7 +16,6 @@ type app struct {
 
 type globalOptions struct {
 	pinHome string
-	pinBin  string
 }
 
 var errHelp = errors.New("help requested")
@@ -62,7 +61,7 @@ func (a app) run(args []string) error {
 		if err != nil {
 			return err
 		}
-		ctx, err := resolveContext(toolOrPath, hasArg, opts.pinHome, opts.pinBin)
+		ctx, err := resolveContext(toolOrPath, hasArg, opts.pinHome)
 		if err != nil {
 			return err
 		}
@@ -93,13 +92,11 @@ func (a app) run(args []string) error {
 func parseGlobalOptions(args []string, stdout io.Writer) (globalOptions, []string, error) {
 	opts := globalOptions{
 		pinHome: defaultPinHome(),
-		pinBin:  defaultPinBin(),
 	}
 
 	flags := flag.NewFlagSet("pin", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	flags.StringVar(&opts.pinHome, "pin-home", opts.pinHome, "")
-	flags.StringVar(&opts.pinBin, "pin-bin", opts.pinBin, "")
 	flags.Usage = func() { printUsage(stdout) }
 
 	if err := flags.Parse(args); err != nil {
@@ -110,7 +107,6 @@ func parseGlobalOptions(args []string, stdout io.Writer) (globalOptions, []strin
 	}
 
 	opts.pinHome = expandPath(opts.pinHome)
-	opts.pinBin = expandPath(opts.pinBin)
 	return opts, flags.Args(), nil
 }
 
@@ -125,7 +121,7 @@ func optionalSingleArg(command string, args []string) (string, bool, error) {
 }
 
 func printUsage(w io.Writer) {
-	fmt.Fprintln(w, "Usage: pin [--pin-home PATH] [--pin-bin PATH] <command> [tool_or_path]")
+	fmt.Fprintln(w, "Usage: pin [--pin-home PATH] <command> [tool_or_path]")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Commands:")
 	fmt.Fprintln(w, "  init [path]")
@@ -140,7 +136,7 @@ func printUsage(w io.Writer) {
 func printCommandUsage(w io.Writer, command string) {
 	switch command {
 	case "init":
-		fmt.Fprintln(w, "Usage: pin init [--name NAME] [--source PATH] [--entrypoint NAME] [--requirements PATH] [--branch BRANCH] [--remote REMOTE] [--preflight COMMAND] [--verify COMMAND] [--link=false] [path]")
+		fmt.Fprintln(w, "Usage: pin init [--name NAME] [--source PATH] [--entrypoint NAME] [--requirements PATH] [--inject PATH] [--branch BRANCH] [--remote REMOTE] [--preflight COMMAND] [--verify COMMAND] [path]")
 	case "status", "verify", "check", "update", "rollback":
 		fmt.Fprintf(w, "Usage: pin %s [tool_or_path]\n", command)
 	case "list":
@@ -163,17 +159,6 @@ func defaultPinHome() string {
 		return "."
 	}
 	return filepath.Join(home, ".local", "share")
-}
-
-func defaultPinBin() string {
-	if value := os.Getenv("PIN_BIN"); value != "" {
-		return expandPath(value)
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "."
-	}
-	return filepath.Join(home, ".local", "bin")
 }
 
 func expandPath(path string) string {
@@ -217,7 +202,9 @@ func (r statusReport) writeTo(w io.Writer) {
 	fmt.Fprintf(w, "tool_root: %s\n", ctx.toolRoot())
 	fmt.Fprintf(w, "current: %s\n", formatLink(ctx.currentLink()))
 	fmt.Fprintf(w, "previous: %s\n", formatLink(ctx.previousLink()))
-	fmt.Fprintf(w, "entrypoint: %s\n", ctx.stableEntrypoint())
+	for _, path := range statusInjectedFiles(ctx, current) {
+		fmt.Fprintf(w, "inject: %s\n", path)
+	}
 	if current != nil {
 		fmt.Fprintf(w, "release: %s\n", current.string("git_sha"))
 		fmt.Fprintf(w, "release_path: %s\n", releasePath(ctx, current.string("git_sha")))
@@ -226,6 +213,36 @@ func (r statusReport) writeTo(w io.Writer) {
 		fmt.Fprintf(w, "source_path: %s\n", ctx.config.sourcePath)
 		fmt.Fprintf(w, "branch: %s\n", branchRef(*ctx.config))
 	}
+}
+
+func statusInjectedFiles(ctx pinContext, current releaseMetadata) []string {
+	if ctx.config != nil && len(ctx.config.inject) != 0 {
+		return resolveInjectedFiles(ctx.config.sourcePath, ctx.config.inject)
+	}
+	if current == nil {
+		return nil
+	}
+	raw, ok := current["config"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	inject, err := relativePathListFromMetadata(raw["inject"])
+	if err != nil || len(inject) == 0 {
+		return nil
+	}
+	sourcePath := current.string("source_path")
+	if sourcePath == "" {
+		return inject
+	}
+	return resolveInjectedFiles(sourcePath, inject)
+}
+
+func resolveInjectedFiles(sourcePath string, inject []string) []string {
+	paths := make([]string, 0, len(inject))
+	for _, path := range inject {
+		paths = append(paths, filepath.Join(sourcePath, path))
+	}
+	return paths
 }
 
 func (a app) commandVerify(ctx pinContext) error {
@@ -270,7 +287,6 @@ func (a app) commandUpdate(ctx pinContext) error {
 
 	fmt.Fprintf(a.stdout, "updated: %s %s\n", ctx.name, report.gitSHA)
 	fmt.Fprintf(a.stdout, "current: %s -> %s\n", report.currentLink, report.currentTarget)
-	fmt.Fprintf(a.stdout, "entrypoint: %s\n", report.entrypoint)
 	return nil
 }
 
@@ -295,7 +311,7 @@ func (a app) commandList(opts globalOptions) error {
 		if !entry.IsDir() {
 			continue
 		}
-		ctx := pinContext{name: entry.Name(), pinHome: opts.pinHome, pinBin: opts.pinBin}
+		ctx := pinContext{name: entry.Name(), pinHome: opts.pinHome}
 		metadata, err := readCurrentMetadata(ctx)
 		if err != nil {
 			return err
@@ -303,8 +319,7 @@ func (a app) commandList(opts globalOptions) error {
 		if metadata == nil {
 			continue
 		}
-		entrypoint := metadata.string("entrypoint")
-		fmt.Fprintf(a.stdout, "%s\t%s\t%s\t%s\n", ctx.name, metadata.string("git_sha"), ctx.toolRoot(), filepath.Join(opts.pinBin, entrypoint))
+		fmt.Fprintf(a.stdout, "%s\t%s\t%s\t%s\n", ctx.name, metadata.string("git_sha"), ctx.toolRoot(), ctx.currentLink())
 	}
 	return nil
 }

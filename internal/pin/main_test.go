@@ -22,7 +22,7 @@ func runPin(t *testing.T, root string, args ...string) cliResult {
 	t.Helper()
 	prepareToolEnv(t, root)
 	var stdout, stderr bytes.Buffer
-	allArgs := append([]string{"--pin-home", filepath.Join(root, "share"), "--pin-bin", filepath.Join(root, "bin")}, args...)
+	allArgs := append([]string{"--pin-home", filepath.Join(root, "share")}, args...)
 	code := RunCLI(allArgs, &stdout, &stderr)
 	return cliResult{code: code, stdout: stdout.String(), stderr: stderr.String()}
 }
@@ -34,7 +34,7 @@ func runCompiledPin(t *testing.T, root string, args ...string) cliResult {
 	if _, err := os.Stat(bin); err != nil {
 		run(t, "", "go", "build", "-o", bin, "../..")
 	}
-	allArgs := append([]string{"--pin-home", filepath.Join(root, "share"), "--pin-bin", filepath.Join(root, "bin")}, args...)
+	allArgs := append([]string{"--pin-home", filepath.Join(root, "share")}, args...)
 	command := exec.Command(bin, allArgs...)
 	var stdout, stderr bytes.Buffer
 	command.Stdout = &stdout
@@ -171,7 +171,6 @@ branch = "main"
 remote = "origin"
 preflight = [["python3", "-c", "from pathlib import Path; assert Path('demo_tool.py').is_file()"]]
 verify = ["demo-tool"]
-link = true
 `)
 }
 
@@ -191,7 +190,6 @@ branch = "main"
 remote = "origin"
 preflight = [["python3", "-c", "from pathlib import Path; compile(Path('automation/demo_tool.py').read_text(), 'automation/demo_tool.py', 'exec')"]]
 verify = [["demo-tool", "verify"]]
-link = true
 `)
 	writeFile(t, filepath.Join(repo, "requirements.txt"), "")
 }
@@ -277,10 +275,14 @@ func requireContains(t *testing.T, text, want string) {
 
 func requireInstalledVersion(t *testing.T, root, version string) {
 	t.Helper()
-	output := run(t, "", filepath.Join(root, "bin", "demo-tool"))
+	output := run(t, "", activeEntrypoint(root))
 	if output != "demo "+version {
 		t.Fatalf("demo-tool output = %q, want %q", output, "demo "+version)
 	}
+}
+
+func activeEntrypoint(root string) string {
+	return filepath.Join(root, "share", "demo-tool", "current", ".venv", "bin", "demo-tool")
 }
 
 func requireReleaseLink(t *testing.T, root, linkName, sha string) {
@@ -318,6 +320,9 @@ func requireReleaseMetadata(t *testing.T, root, sha string) {
 	}
 	if _, ok := metadata["config"].(map[string]any); !ok {
 		t.Fatalf("metadata config is missing or invalid: %#v", metadata["config"])
+	}
+	if got, _ := metadata["schema_version"].(float64); got != float64(schemaVersion) {
+		t.Fatalf("metadata schema_version = %v, want %d", metadata["schema_version"], schemaVersion)
 	}
 }
 
@@ -364,9 +369,6 @@ func TestInitCreatesDefaultConfig(t *testing.T) {
 	if got := config.verify; len(got) != 1 || strings.Join(got[0], " ") != "daily-report --help" {
 		t.Fatalf("verify = %#v, want daily-report --help", got)
 	}
-	if !config.link {
-		t.Fatal("link = false, want true")
-	}
 }
 
 func TestInitAcceptsConfigFlags(t *testing.T) {
@@ -384,11 +386,12 @@ func TestInitAcceptsConfigFlags(t *testing.T) {
 		"--entrypoint", "report",
 		"--source", "scripts/report.py",
 		"--requirements", "requirements.txt",
+		"--inject", ".env",
+		"--inject", "config/local.toml",
 		"--branch", "stable",
 		"--remote", "upstream",
 		"--preflight", "python3 -m py_compile scripts/report.py",
 		"--verify", "report --help",
-		"--link=false",
 		repo,
 	)
 	requireCode(t, result, 0)
@@ -400,6 +403,9 @@ func TestInitAcceptsConfigFlags(t *testing.T) {
 	if config.name != "daily-report" || config.entrypoint != "report" || config.source.path != "scripts/report.py" || config.source.kind != sourceScript || config.requirements != "requirements.txt" {
 		t.Fatalf("unexpected config: %#v", config)
 	}
+	if got := strings.Join(config.inject, ","); got != ".env,config/local.toml" {
+		t.Fatalf("inject = %q, want .env,config/local.toml", got)
+	}
 	if config.branch != "stable" || config.remote != "upstream" {
 		t.Fatalf("branch/remote = %s/%s, want stable/upstream", config.branch, config.remote)
 	}
@@ -408,9 +414,6 @@ func TestInitAcceptsConfigFlags(t *testing.T) {
 	}
 	if got := config.verify; len(got) != 1 || strings.Join(got[0], " ") != "report --help" {
 		t.Fatalf("verify = %#v", got)
-	}
-	if config.link {
-		t.Fatal("link = true, want false")
 	}
 }
 
@@ -444,6 +447,12 @@ func testUpdateStatusVerifyAndList(t *testing.T, runner pinRunner) {
 	if info, err := os.Stat(release); err != nil || !info.IsDir() {
 		t.Fatalf("missing release: %s", release)
 	}
+	if _, err := os.Stat(filepath.Join(release, "pin.toml")); err != nil {
+		t.Fatalf("release should expose checkout files at root: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(release, "src")); !os.IsNotExist(err) {
+		t.Fatalf("release should not contain nested src directory: %s", filepath.Join(release, "src"))
+	}
 	currentTarget, err := filepath.EvalSymlinks(filepath.Join(root, "share", "demo-tool", "current"))
 	if err != nil {
 		t.Fatal(err)
@@ -455,13 +464,8 @@ func testUpdateStatusVerifyAndList(t *testing.T, runner pinRunner) {
 	if currentTarget != canonicalRelease {
 		t.Fatalf("current points to %s, want %s", currentTarget, canonicalRelease)
 	}
-	entrypointTarget, err := os.Readlink(filepath.Join(root, "bin", "demo-tool"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	expectedEntrypoint := filepath.Join(root, "share", "demo-tool", "current", "venv", "bin", "demo-tool")
-	if entrypointTarget != expectedEntrypoint {
-		t.Fatalf("entrypoint points to %s, want %s", entrypointTarget, expectedEntrypoint)
+	if _, err := os.Stat(activeEntrypoint(root)); err != nil {
+		t.Fatalf("missing active release entrypoint: %v", err)
 	}
 
 	result = runTool(t, runner, root, repo, "status")
@@ -584,31 +588,21 @@ func TestE2ECompiledBinaryCheckDiverged(t *testing.T) {
 	requireContains(t, result.stdout, "status: diverged")
 }
 
-func TestE2ECompiledBinaryUpdateWithoutStableLink(t *testing.T) {
+func TestE2ECompiledBinaryReleaseEntrypoint(t *testing.T) {
 	root := t.TempDir()
 	repo, _ := sourceRepo(t, root)
 
-	replaceInFile(t, filepath.Join(repo, "pin.toml"), "link = true", "link = false")
-	git(t, repo, "add", ".")
-	git(t, repo, "commit", "-m", "disable stable link")
-	git(t, repo, "push")
 	sha := git(t, repo, "rev-parse", "HEAD")
 
 	result := runTool(t, runCompiledPin, root, repo, "update")
 	requireCode(t, result, 0)
 	requireContains(t, result.stdout, "updated: demo-tool "+sha)
 
-	stableEntrypoint := filepath.Join(root, "bin", "demo-tool")
-	if _, err := os.Lstat(stableEntrypoint); !os.IsNotExist(err) {
-		t.Fatalf("stable entrypoint exists despite link=false: %s", stableEntrypoint)
-	}
-
 	result = runTool(t, runCompiledPin, root, repo, "verify")
 	requireCode(t, result, 0)
 	requireContains(t, result.stdout, "verified: demo-tool "+sha)
 
-	releaseEntrypoint := filepath.Join(root, "share", "demo-tool", "current", "venv", "bin", "demo-tool")
-	output := run(t, "", releaseEntrypoint)
+	output := run(t, "", activeEntrypoint(root))
 	if output != "demo 1" {
 		t.Fatalf("release entrypoint output = %q, want %q", output, "demo 1")
 	}
@@ -627,7 +621,7 @@ func TestE2ECompiledBinaryPythonScriptLifecycle(t *testing.T) {
 	requireCode(t, result, 0)
 	requireContains(t, result.stdout, "updated: demo-tool "+oldSHA)
 	requireReleaseLink(t, root, "current", oldSHA)
-	output := run(t, "", filepath.Join(root, "bin", "demo-tool"), "cron")
+	output := run(t, "", activeEntrypoint(root), "cron")
 	if output != "script 1 from-source cron" {
 		t.Fatalf("script output = %q, want %q", output, "script 1 from-source cron")
 	}
@@ -657,7 +651,7 @@ func TestE2ECompiledBinaryPythonScriptLifecycle(t *testing.T) {
 	requireContains(t, result.stdout, "updated: demo-tool "+newSHA)
 	requireReleaseLink(t, root, "current", newSHA)
 	requireReleaseLink(t, root, "previous", oldSHA)
-	output = run(t, "", filepath.Join(root, "bin", "demo-tool"), "agent")
+	output = run(t, "", activeEntrypoint(root), "agent")
 	if output != "script 2 from-source agent" {
 		t.Fatalf("script output = %q, want %q", output, "script 2 from-source agent")
 	}
@@ -665,10 +659,178 @@ func TestE2ECompiledBinaryPythonScriptLifecycle(t *testing.T) {
 	result = runTool(t, runCompiledPin, root, repo, "rollback")
 	requireCode(t, result, 0)
 	requireReleaseLink(t, root, "current", oldSHA)
-	output = run(t, "", filepath.Join(root, "bin", "demo-tool"), "cron")
+	output = run(t, "", activeEntrypoint(root), "cron")
 	if output != "script 1 from-source cron" {
 		t.Fatalf("script output after rollback = %q, want %q", output, "script 1 from-source cron")
 	}
+}
+
+func TestE2ECompiledBinaryInjectSymlinksMutableCheckoutFiles(t *testing.T) {
+	root := t.TempDir()
+	repo, _ := sourceRepo(t, root)
+	writeScriptTool(t, repo, "1")
+	writeFile(t, filepath.Join(repo, ".gitignore"), ".env\nconfig/local.toml\n")
+	writeFile(t, filepath.Join(repo, ".env"), "TOKEN=alpha\n")
+	writeFile(t, filepath.Join(repo, "config", "local.toml"), "mode = \"local\"\n")
+	writeFile(t, filepath.Join(repo, "automation", "demo_tool.py"), `import sys
+from pathlib import Path
+
+print(Path(".env").read_text().strip() + " " + Path("config/local.toml").read_text().strip() + " " + " ".join(sys.argv[1:]))
+`)
+	appendFile(t, filepath.Join(repo, "pin.toml"), `inject = [".env", "config/local.toml"]`+"\n")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-m", "add runtime injection")
+	git(t, repo, "push")
+	sha := git(t, repo, "rev-parse", "HEAD")
+
+	result := runTool(t, runCompiledPin, root, repo, "update")
+	requireCode(t, result, 0)
+	requireContains(t, result.stdout, "updated: demo-tool "+sha)
+
+	releaseEnv := filepath.Join(root, "share", "demo-tool", "releases", sha, ".env")
+	target, err := os.Readlink(releaseEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceEnv := filepath.Join(repo, ".env")
+	if target != sourceEnv {
+		t.Fatalf("inject symlink = %s, want %s", target, sourceEnv)
+	}
+	releaseConfig := filepath.Join(root, "share", "demo-tool", "releases", sha, "config", "local.toml")
+	target, err = os.Readlink(releaseConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceConfig := filepath.Join(repo, "config", "local.toml")
+	if target != sourceConfig {
+		t.Fatalf("inject symlink = %s, want %s", target, sourceConfig)
+	}
+
+	output := run(t, "", activeEntrypoint(root), "first")
+	if output != `TOKEN=alpha mode = "local" first` {
+		t.Fatalf("script output = %q", output)
+	}
+
+	writeFile(t, sourceEnv, "TOKEN=beta\n")
+	output = run(t, "", activeEntrypoint(root), "second")
+	if output != `TOKEN=beta mode = "local" second` {
+		t.Fatalf("script output after env rotation = %q", output)
+	}
+
+	result = runTool(t, runCompiledPin, root, repo, "status")
+	requireCode(t, result, 0)
+	requireContains(t, result.stdout, "inject: "+sourceEnv)
+	requireContains(t, result.stdout, "inject: "+sourceConfig)
+
+	result = runTool(t, runCompiledPin, root, repo, "verify")
+	requireCode(t, result, 0)
+}
+
+func TestE2ECompiledBinaryRollbackUsesPreviousReleaseInjectList(t *testing.T) {
+	root := t.TempDir()
+	repo, _ := sourceRepo(t, root)
+	writeFile(t, filepath.Join(repo, ".gitignore"), ".env\nconfig/local.toml\n")
+	writeFile(t, filepath.Join(repo, ".env"), "TOKEN=old\n")
+	appendFile(t, filepath.Join(repo, "pin.toml"), `inject = [".env"]`+"\n")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-m", "inject env")
+	git(t, repo, "push")
+	oldSHA := git(t, repo, "rev-parse", "HEAD")
+
+	result := runTool(t, runCompiledPin, root, repo, "update")
+	requireCode(t, result, 0)
+	requireReleaseLink(t, root, "current", oldSHA)
+
+	writeFile(t, filepath.Join(repo, "config", "local.toml"), "mode = \"new\"\n")
+	replaceInFile(
+		t,
+		filepath.Join(repo, "pin.toml"),
+		`inject = [".env"]`,
+		`inject = [".env", "config/local.toml"]`,
+	)
+	git(t, repo, "add", "pin.toml", ".gitignore")
+	git(t, repo, "commit", "-m", "inject local config")
+	git(t, repo, "push")
+	newSHA := git(t, repo, "rev-parse", "HEAD")
+
+	result = runTool(t, runCompiledPin, root, repo, "update")
+	requireCode(t, result, 0)
+	requireReleaseLink(t, root, "current", newSHA)
+	requireReleaseLink(t, root, "previous", oldSHA)
+
+	if err := os.Remove(filepath.Join(repo, "config", "local.toml")); err != nil {
+		t.Fatal(err)
+	}
+
+	result = runTool(t, runCompiledPin, root, repo, "rollback")
+	requireCode(t, result, 0)
+	requireContains(t, result.stdout, "rolled back: demo-tool "+oldSHA)
+	requireReleaseLink(t, root, "current", oldSHA)
+	requireReleaseLink(t, root, "previous", newSHA)
+}
+
+func TestE2ECompiledBinaryMissingInjectedFileStopsUpdate(t *testing.T) {
+	root := t.TempDir()
+	repo, _ := sourceRepo(t, root)
+	writeScriptTool(t, repo, "1")
+	appendFile(t, filepath.Join(repo, "pin.toml"), `inject = [".env"]`+"\n")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-m", "require injected file")
+	git(t, repo, "push")
+
+	result := runTool(t, runCompiledPin, root, repo, "update")
+	requireCode(t, result, 2)
+	requireContains(t, result.stderr, "inject files: missing injected file")
+
+	currentLink := filepath.Join(root, "share", "demo-tool", "current")
+	if _, err := os.Lstat(currentLink); !os.IsNotExist(err) {
+		t.Fatalf("current release exists after missing injected file: %s", currentLink)
+	}
+}
+
+func TestE2ECompiledBinaryInjectRefusesSymlinkedArchiveParent(t *testing.T) {
+	root := t.TempDir()
+	repo, _ := sourceRepo(t, root)
+	writeScriptTool(t, repo, "1")
+	outside := filepath.Join(root, "outside")
+	if err := os.Mkdir(outside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(repo, "config")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(repo, "config")); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(outside, "local.toml"), "mode = \"local\"\n")
+	appendFile(t, filepath.Join(repo, "pin.toml"), `inject = ["config/local.toml"]`+"\n")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-m", "add symlinked config")
+	git(t, repo, "push")
+
+	result := runTool(t, runCompiledPin, root, repo, "update")
+	requireCode(t, result, 2)
+	requireContains(t, result.stderr, "inject parent is a symlink in archived checkout")
+	data, err := os.ReadFile(filepath.Join(outside, "local.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "mode = \"local\"\n" {
+		t.Fatalf("source file changed through archive symlink: %q", data)
+	}
+}
+
+func TestE2ECompiledBinaryTrackedReservedRuntimePathStopsUpdate(t *testing.T) {
+	root := t.TempDir()
+	repo, _ := sourceRepo(t, root)
+	writeFile(t, filepath.Join(repo, ".venv", "tracked.txt"), "tracked\n")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-m", "track reserved runtime path")
+	git(t, repo, "push")
+
+	result := runTool(t, runCompiledPin, root, repo, "update")
+	requireCode(t, result, 2)
+	requireContains(t, result.stderr, "reserved runtime path already exists in archived checkout")
 }
 
 func TestE2ECompiledBinaryPythonScriptEntrypointVenvCollisionDoesNotActivate(t *testing.T) {
@@ -747,54 +909,6 @@ func TestE2ECompiledBinaryVerifyFailureDoesNotActivateRelease(t *testing.T) {
 	}
 }
 
-func TestE2ECompiledBinaryEntrypointCollisionDoesNotActivate(t *testing.T) {
-	root := t.TempDir()
-	repo, _ := sourceRepo(t, root)
-	stableEntrypoint := filepath.Join(root, "bin", "demo-tool")
-	writeFile(t, stableEntrypoint, "not managed by pin\n")
-
-	result := runTool(t, runCompiledPin, root, repo, "update")
-	requireCode(t, result, 2)
-	requireContains(t, result.stderr, "entrypoint path exists and is not a symlink")
-
-	currentLink := filepath.Join(root, "share", "demo-tool", "current")
-	if _, err := os.Lstat(currentLink); !os.IsNotExist(err) {
-		t.Fatalf("current release exists after entrypoint collision: %s", currentLink)
-	}
-	data, err := os.ReadFile(stableEntrypoint)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(data) != "not managed by pin\n" {
-		t.Fatalf("entrypoint collision file was modified: %q", string(data))
-	}
-}
-
-func TestE2ECompiledBinaryRollbackEntrypointCollisionDoesNotActivate(t *testing.T) {
-	root := t.TempDir()
-	repo, oldSHA := sourceRepo(t, root)
-
-	result := runTool(t, runCompiledPin, root, repo, "update")
-	requireCode(t, result, 0)
-	newSHA := commitToolVersion(t, repo, "2", false)
-	git(t, repo, "push")
-	result = runTool(t, runCompiledPin, root, repo, "update")
-	requireCode(t, result, 0)
-	requireInstalledVersion(t, root, "2")
-
-	stableEntrypoint := filepath.Join(root, "bin", "demo-tool")
-	if err := os.Remove(stableEntrypoint); err != nil {
-		t.Fatal(err)
-	}
-	writeFile(t, stableEntrypoint, "not managed by pin\n")
-
-	result = runTool(t, runCompiledPin, root, repo, "rollback")
-	requireCode(t, result, 2)
-	requireContains(t, result.stderr, "entrypoint path exists and is not a symlink")
-	requireReleaseLink(t, root, "current", newSHA)
-	requireReleaseLink(t, root, "previous", oldSHA)
-}
-
 func TestUpdateRefusesDirtySource(t *testing.T) {
 	root := t.TempDir()
 	repo, _ := sourceRepo(t, root)
@@ -821,6 +935,10 @@ func TestConfigRejectsPathEscapingValues(t *testing.T) {
 		{"source", "/tmp/escape.py"},
 		{"requirements", "../requirements.txt"},
 		{"requirements", "/tmp/requirements.txt"},
+		{"inject", "../.env"},
+		{"inject", "/tmp/.env"},
+		{"inject", ".venv/file"},
+		{"inject", ".pin/env"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.key+"="+tc.badValue, func(t *testing.T) {
@@ -828,6 +946,8 @@ func TestConfigRejectsPathEscapingValues(t *testing.T) {
 			repo, _ := sourceRepo(t, root)
 			if tc.key == "entrypoint" || tc.key == "requirements" {
 				appendFile(t, filepath.Join(repo, "pin.toml"), tc.key+` = "`+tc.badValue+`"`+"\n")
+			} else if tc.key == "inject" {
+				appendFile(t, filepath.Join(repo, "pin.toml"), tc.key+` = ["`+tc.badValue+`"]`+"\n")
 			} else {
 				oldValue := "demo-tool"
 				if tc.key == "source" {
@@ -841,8 +961,11 @@ func TestConfigRejectsPathEscapingValues(t *testing.T) {
 				t.Fatalf("update code = %d, want 2", result.code)
 			}
 			want := "pin.toml key \"" + tc.key + "\" must be a single path segment"
-			if tc.key == "source" || tc.key == "requirements" {
+			if tc.key == "source" || tc.key == "requirements" || tc.key == "inject" {
 				want = "pin.toml key \"" + tc.key + "\" must"
+			}
+			if tc.key == "inject" && isReservedRuntimePath(filepath.Clean(tc.badValue)) {
+				want = `pin.toml key "inject" uses reserved runtime path`
 			}
 			if !strings.Contains(result.stderr, want) {
 				t.Fatalf("unexpected error: %s", result.stderr)
@@ -889,20 +1012,22 @@ func TestConfigDefaultsEntrypointToName(t *testing.T) {
 	root := t.TempDir()
 	repo, _ := sourceRepo(t, root)
 
-	result := runTool(t, runPin, root, repo, "status")
+	result := runTool(t, runPin, root, repo, "update")
 	requireCode(t, result, 0)
-	requireContains(t, result.stdout, "entrypoint: "+filepath.Join(root, "bin", "demo-tool"))
+	if _, err := os.Stat(activeEntrypoint(root)); err != nil {
+		t.Fatalf("missing default entrypoint in active release: %v", err)
+	}
 }
 
 func TestEntrypointEnvReplacesExistingPath(t *testing.T) {
 	t.Setenv("PATH", "/usr/bin")
-	env := entrypointEnv("/tmp/release/venv/bin/demo-tool")
+	env := entrypointEnv("/tmp/release/.venv/bin/demo-tool")
 
 	pathEntries := 0
 	for _, item := range env {
 		if strings.HasPrefix(item, "PATH=") {
 			pathEntries++
-			if item != "PATH=/tmp/release/venv/bin:/usr/bin" {
+			if item != "PATH=/tmp/release/.venv/bin:/usr/bin" {
 				t.Fatalf("PATH = %q", item)
 			}
 		}

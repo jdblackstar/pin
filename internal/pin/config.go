@@ -17,11 +17,11 @@ type config struct {
 	entrypoint   string
 	source       installSource
 	requirements string
+	inject       []string
 	branch       string
 	remote       string
 	preflight    [][]string
 	verify       [][]string
-	link         bool
 	sourcePath   string
 	configPath   string
 	raw          map[string]any
@@ -42,7 +42,6 @@ type installSource struct {
 type pinContext struct {
 	name    string
 	pinHome string
-	pinBin  string
 	config  *config
 }
 
@@ -62,11 +61,7 @@ func (ctx pinContext) previousLink() string {
 	return filepath.Join(ctx.toolRoot(), "previous")
 }
 
-func (ctx pinContext) stableEntrypoint() string {
-	return filepath.Join(ctx.pinBin, configuredEntrypoint(ctx))
-}
-
-func resolveContext(toolOrPath string, hasArg bool, pinHome, pinBin string) (pinContext, error) {
+func resolveContext(toolOrPath string, hasArg bool, pinHome string) (pinContext, error) {
 	var candidate string
 	if !hasArg {
 		wd, err := os.Getwd()
@@ -91,15 +86,15 @@ func resolveContext(toolOrPath string, hasArg bool, pinHome, pinBin string) (pin
 		if err != nil {
 			return pinContext{}, err
 		}
-		return pinContext{config.name, pinHome, pinBin, config}, nil
+		return pinContext{config.name, pinHome, config}, nil
 	}
 
 	name, err := validatePathSegment(toolOrPath, "tool name")
 	if err != nil {
 		return pinContext{}, err
 	}
-	ctx := pinContext{name: name, pinHome: pinHome, pinBin: pinBin}
-	metadata, err := readMetadataForTool(pinHome, pinBin, name)
+	ctx := pinContext{name: name, pinHome: pinHome}
+	metadata, err := readMetadataForTool(pinHome, name)
 	if err != nil {
 		return pinContext{}, err
 	}
@@ -218,6 +213,10 @@ func buildConfig(raw map[string]any, name, entrypoint, branch, remote, sourcePat
 	if requirements != "" && source.kind != sourceScript {
 		return nil, fmt.Errorf("%s key %q requires key %q to point to a Python script", configName, "requirements", "source")
 	}
+	inject, err := optionalRelativePathList(raw, "inject", nil)
+	if err != nil {
+		return nil, err
+	}
 
 	preflight := [][]string{}
 	if value, ok := raw["preflight"]; ok {
@@ -235,21 +234,16 @@ func buildConfig(raw map[string]any, name, entrypoint, branch, remote, sourcePat
 		}
 	}
 
-	link, err := optionalBool(raw, "link", true)
-	if err != nil {
-		return nil, err
-	}
-
 	return &config{
 		name:         name,
 		entrypoint:   entrypoint,
 		source:       source,
 		requirements: requirements,
+		inject:       inject,
 		branch:       branch,
 		remote:       remote,
 		preflight:    preflight,
 		verify:       verify,
-		link:         link,
 		sourcePath:   sourcePath,
 		configPath:   configPath,
 		raw:          raw,
@@ -300,6 +294,60 @@ func optionalRelativePath(raw map[string]any, key, fallback string) (string, err
 	return validateRelativePath(value, fmt.Sprintf("%s key %q", configName, key))
 }
 
+func optionalRelativePathList(raw map[string]any, key string, fallback []string) ([]string, error) {
+	value, ok := raw[key]
+	if !ok {
+		return fallback, nil
+	}
+	items, err := relativePathListFromMetadata(value)
+	if err != nil {
+		return nil, fmt.Errorf("%s key %q must be a list", configName, key)
+	}
+	paths := make([]string, 0, len(items))
+	seen := map[string]bool{}
+	for _, item := range items {
+		path, err := validateRelativePath(item, fmt.Sprintf("%s key %q", configName, key))
+		if err != nil {
+			return nil, err
+		}
+		if isReservedRuntimePath(path) {
+			return nil, fmt.Errorf("%s key %q uses reserved runtime path %q", configName, key, path)
+		}
+		if seen[path] {
+			return nil, fmt.Errorf("%s key %q contains duplicate path %q", configName, key, path)
+		}
+		seen[path] = true
+		paths = append(paths, path)
+	}
+	return paths, nil
+}
+
+func isReservedRuntimePath(path string) bool {
+	first, _, _ := strings.Cut(path, string(filepath.Separator))
+	switch first {
+	case metadataDir, venvDir, ".cache":
+		return true
+	default:
+		return false
+	}
+}
+
+func relativePathListFromMetadata(value any) ([]string, error) {
+	items, ok := asAnySlice(value)
+	if !ok {
+		return nil, fmt.Errorf("not a list")
+	}
+	paths := make([]string, 0, len(items))
+	for _, item := range items {
+		text, ok := item.(string)
+		if !ok || text == "" {
+			return nil, fmt.Errorf("not a path list")
+		}
+		paths = append(paths, text)
+	}
+	return paths, nil
+}
+
 func parseInstallSource(raw map[string]any) (installSource, error) {
 	path, err := requireString(raw, "source")
 	if err != nil {
@@ -317,18 +365,6 @@ func parseInstallSourceValue(path string) (installSource, error) {
 		return installSource{path: path, kind: sourceScript}, nil
 	}
 	return installSource{path: path, kind: sourcePackage}, nil
-}
-
-func optionalBool(raw map[string]any, key string, fallback bool) (bool, error) {
-	value, ok := raw[key]
-	if !ok {
-		return fallback, nil
-	}
-	boolean, ok := value.(bool)
-	if !ok {
-		return false, fmt.Errorf("%s key %q must be a boolean", configName, key)
-	}
-	return boolean, nil
 }
 
 func parseCommands(value any, key string) ([][]string, error) {

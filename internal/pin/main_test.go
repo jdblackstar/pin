@@ -433,6 +433,10 @@ func TestDefaultCommandsFallBackToLegacyWhenNamespacedCurrentIsInvalid(t *testin
 	requireContains(t, result.stdout, "tool_root: "+legacyHomeToolRoot(root))
 	requireContains(t, result.stdout, "release: "+oldSHA)
 
+	result = runPinWithHome(t, root, "list")
+	requireCode(t, result, 0)
+	requireContains(t, result.stdout, "demo-tool\t"+oldSHA+"\t"+legacyHomeToolRoot(root))
+
 	result = runPinWithHome(t, root, "run", "demo-tool")
 	requireCode(t, result, 0)
 	if strings.TrimSpace(result.stdout) != "demo 1" {

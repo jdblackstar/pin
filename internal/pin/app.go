@@ -408,7 +408,7 @@ func (a app) commandRun(ctx pinContext, args []string) error {
 
 func (a app) commandList(opts globalOptions) error {
 	seen := map[string]bool{}
-	if err := a.writeCurrentList(opts.pinHome, seen); err != nil {
+	if err := a.writeCurrentList(opts, seen); err != nil {
 		return err
 	}
 	if opts.legacyPinHome == "" {
@@ -417,8 +417,8 @@ func (a app) commandList(opts globalOptions) error {
 	return a.writeLegacyList(opts.legacyPinHome, seen)
 }
 
-func (a app) writeCurrentList(pinHome string, seen map[string]bool) error {
-	entries, err := os.ReadDir(pinHome)
+func (a app) writeCurrentList(opts globalOptions, seen map[string]bool) error {
+	entries, err := os.ReadDir(opts.pinHome)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
@@ -432,9 +432,12 @@ func (a app) writeCurrentList(pinHome string, seen map[string]bool) error {
 		if seen[entry.Name()] {
 			continue
 		}
-		ctx := pinContext{name: entry.Name(), pinHome: pinHome}
+		ctx := pinContext{name: entry.Name(), pinHome: opts.pinHome}
 		metadata, err := readCurrentMetadata(ctx)
 		if err != nil {
+			if _, ok, legacyErr := legacyContext(entry.Name(), opts); legacyErr == nil && ok {
+				continue
+			}
 			return err
 		}
 		if metadata == nil {

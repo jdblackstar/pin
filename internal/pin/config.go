@@ -98,6 +98,10 @@ func resolveContext(toolOrPath string, hasArg bool, opts globalOptions) (pinCont
 		ctx := pinContext{config.name, opts.pinHome, config}
 		metadata, err := readMetadataForTool(opts.pinHome, ctx.name)
 		if err != nil {
+			if ok, legacyErr := legacyInstallExists(ctx.name, opts); legacyErr == nil && ok {
+				ctx.pinHome = opts.legacyPinHome
+				return ctx, nil
+			}
 			return pinContext{}, err
 		}
 		if metadata == nil {
@@ -118,6 +122,9 @@ func resolveContext(toolOrPath string, hasArg bool, opts globalOptions) (pinCont
 	ctx := pinContext{name: name, pinHome: opts.pinHome}
 	metadata, err := readMetadataForTool(opts.pinHome, name)
 	if err != nil {
+		if legacy, ok, legacyErr := legacyContext(name, opts); legacyErr == nil && ok {
+			return legacy, nil
+		}
 		return pinContext{}, err
 	}
 	if metadata == nil {

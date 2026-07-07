@@ -417,6 +417,38 @@ func TestDefaultCommandsFallBackToLegacyLayout(t *testing.T) {
 	}
 }
 
+func TestDefaultCommandsFallBackToLegacyWhenNamespacedCurrentIsInvalid(t *testing.T) {
+	root := t.TempDir()
+	repo, oldSHA := sourceRepo(t, root)
+	legacyPinHome := filepath.Join(root, ".local", "share")
+
+	result := runPinWithPinHome(t, root, legacyPinHome, "update", repo)
+	requireCode(t, result, 0)
+	requireContains(t, result.stdout, "updated: demo-tool "+oldSHA)
+	writeFile(t, filepath.Join(defaultHomeToolRoot(root), "current"), "not a symlink\n")
+
+	result = runPinWithHome(t, root, "status", "demo-tool")
+	requireCode(t, result, 0)
+	requireContains(t, result.stdout, "installed: yes")
+	requireContains(t, result.stdout, "tool_root: "+legacyHomeToolRoot(root))
+	requireContains(t, result.stdout, "release: "+oldSHA)
+
+	result = runPinWithHome(t, root, "run", "demo-tool")
+	requireCode(t, result, 0)
+	if strings.TrimSpace(result.stdout) != "demo 1" {
+		t.Fatalf("run stdout = %q, want demo 1", result.stdout)
+	}
+
+	newSHA := commitToolVersion(t, repo, "2", false)
+	git(t, repo, "push")
+	result = runPinWithHome(t, root, "update", repo)
+	requireCode(t, result, 0)
+	requireContains(t, result.stdout, "current: "+filepath.Join(legacyHomeToolRoot(root), "current")+" -> releases/"+newSHA)
+	if _, err := os.Stat(filepath.Join(legacyHomeToolRoot(root), "releases", newSHA)); err != nil {
+		t.Fatalf("legacy release was not updated: %v", err)
+	}
+}
+
 func TestLegacyRepoPathFallbackUsesCurrentRepoConfig(t *testing.T) {
 	root := t.TempDir()
 	repo, oldSHA := sourceRepo(t, root)

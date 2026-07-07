@@ -86,8 +86,6 @@ func (a app) run(args []string) error {
 	default:
 		return fmt.Errorf("unknown command %q", command)
 	}
-
-	return nil
 }
 
 func (a app) commandWithOptionalContext(command string, args []string, opts globalOptions, run func(pinContext) error) error {

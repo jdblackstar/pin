@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 )
 
@@ -15,7 +16,8 @@ type app struct {
 }
 
 type globalOptions struct {
-	pinHome string
+	pinHome       string
+	legacyPinHome string
 }
 
 var errHelp = errors.New("help requested")
@@ -56,27 +58,26 @@ func (a app) run(args []string) error {
 	switch command {
 	case "init":
 		return a.commandInit(commandArgs)
-	case "status", "verify", "check", "update", "rollback":
-		toolOrPath, hasArg, err := optionalSingleArg(command, commandArgs)
+	case "status":
+		return a.commandWithOptionalContext(command, commandArgs, opts, a.commandStatus)
+	case "verify":
+		return a.commandWithOptionalContext(command, commandArgs, opts, a.commandVerify)
+	case "check":
+		return a.commandWithOptionalContext(command, commandArgs, opts, a.commandCheck)
+	case "update":
+		return a.commandWithOptionalContext(command, commandArgs, opts, a.commandUpdate)
+	case "rollback":
+		return a.commandWithOptionalContext(command, commandArgs, opts, a.commandRollback)
+	case "run":
+		toolOrPath, toolArgs, err := parseRunArgs(commandArgs)
 		if err != nil {
 			return err
 		}
-		ctx, err := resolveContext(toolOrPath, hasArg, opts.pinHome)
+		ctx, err := resolveContext(toolOrPath, true, opts)
 		if err != nil {
 			return err
 		}
-		switch command {
-		case "status":
-			return a.commandStatus(ctx)
-		case "verify":
-			return a.commandVerify(ctx)
-		case "check":
-			return a.commandCheck(ctx)
-		case "update":
-			return a.commandUpdate(ctx)
-		case "rollback":
-			return a.commandRollback(ctx)
-		}
+		return a.commandRun(ctx, toolArgs)
 	case "list":
 		if len(commandArgs) != 0 {
 			return fmt.Errorf("list takes no arguments")
@@ -85,14 +86,26 @@ func (a app) run(args []string) error {
 	default:
 		return fmt.Errorf("unknown command %q", command)
 	}
+}
 
-	return nil
+func (a app) commandWithOptionalContext(command string, args []string, opts globalOptions, run func(pinContext) error) error {
+	toolOrPath, hasArg, err := optionalSingleArg(command, args)
+	if err != nil {
+		return err
+	}
+	ctx, err := resolveContext(toolOrPath, hasArg, opts)
+	if err != nil {
+		return err
+	}
+	return run(ctx)
 }
 
 func parseGlobalOptions(args []string, stdout io.Writer) (globalOptions, []string, error) {
+	legacyHome := legacyPinHome()
 	opts := globalOptions{
 		pinHome: defaultPinHome(),
 	}
+	useLegacyFallback := os.Getenv("PIN_HOME") == ""
 
 	flags := flag.NewFlagSet("pin", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
@@ -107,6 +120,15 @@ func parseGlobalOptions(args []string, stdout io.Writer) (globalOptions, []strin
 	}
 
 	opts.pinHome = expandPath(opts.pinHome)
+	pinHomeFromFlag := false
+	flags.Visit(func(flag *flag.Flag) {
+		if flag.Name == "pin-home" {
+			pinHomeFromFlag = true
+		}
+	})
+	if useLegacyFallback && !pinHomeFromFlag {
+		opts.legacyPinHome = legacyHome
+	}
 	return opts, flags.Args(), nil
 }
 
@@ -130,6 +152,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  check [tool_or_path]")
 	fmt.Fprintln(w, "  update [tool_or_path]")
 	fmt.Fprintln(w, "  rollback [tool_or_path]")
+	fmt.Fprintln(w, "  run tool [-- args...]")
 	fmt.Fprintln(w, "  list")
 }
 
@@ -139,6 +162,8 @@ func printCommandUsage(w io.Writer, command string) {
 		fmt.Fprintln(w, "Usage: pin init [--name NAME] [--source PATH] [--entrypoint NAME] [--requirements PATH] [--inject PATH] [--branch BRANCH] [--remote REMOTE] [--preflight COMMAND] [--verify COMMAND] [path]")
 	case "status", "verify", "check", "update", "rollback":
 		fmt.Fprintf(w, "Usage: pin %s [tool_or_path]\n", command)
+	case "run":
+		fmt.Fprintln(w, "Usage: pin run tool [-- args...]")
 	case "list":
 		fmt.Fprintln(w, "Usage: pin list")
 	default:
@@ -154,9 +179,17 @@ func defaultPinHome() string {
 	if value := os.Getenv("PIN_HOME"); value != "" {
 		return expandPath(value)
 	}
+	legacy := legacyPinHome()
+	if legacy == "" {
+		return "."
+	}
+	return filepath.Join(legacy, "pin")
+}
+
+func legacyPinHome() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return "."
+		return ""
 	}
 	return filepath.Join(home, ".local", "share")
 }
@@ -320,7 +353,71 @@ func (a app) commandRollback(ctx pinContext) error {
 	return nil
 }
 
+func parseRunArgs(args []string) (string, []string, error) {
+	if len(args) == 0 {
+		return "", nil, fmt.Errorf("run requires a tool")
+	}
+	if len(args) == 1 {
+		return args[0], nil, nil
+	}
+	if args[1] != "--" {
+		return "", nil, fmt.Errorf("run arguments must follow --")
+	}
+	return args[0], args[2:], nil
+}
+
+func (a app) commandRun(ctx pinContext, args []string) error {
+	release, err := activeRelease(ctx)
+	if err != nil {
+		return err
+	}
+	metadata, err := readReleaseMetadata(release)
+	if err != nil {
+		return err
+	}
+	config, err := loadConfigFromMetadata(metadata)
+	if err != nil {
+		return err
+	}
+	if err := validateMetadata(ctx, release, metadata, *config); err != nil {
+		return err
+	}
+	if err := verifyInjectedPaths(ctx, release, metadata, *config); err != nil {
+		return err
+	}
+	entrypoint := filepath.Join(release, venvDir, "bin", metadata.string("entrypoint"))
+	if err := requireFile(entrypoint, "missing entrypoint"); err != nil {
+		return err
+	}
+
+	command := exec.Command(entrypoint, args...)
+	command.Dir = release
+	command.Env = entrypointEnv(entrypoint)
+	command.Stdin = os.Stdin
+	command.Stdout = a.stdout
+	command.Stderr = a.stderr
+	if err := command.Run(); err != nil {
+		var exit *exec.ExitError
+		if errors.As(err, &exit) {
+			return exitError{code: exit.ExitCode()}
+		}
+		return err
+	}
+	return nil
+}
+
 func (a app) commandList(opts globalOptions) error {
+	seen := map[string]bool{}
+	if err := a.writeCurrentList(opts, seen); err != nil {
+		return err
+	}
+	if opts.legacyPinHome == "" {
+		return nil
+	}
+	return a.writeLegacyList(opts.legacyPinHome, seen)
+}
+
+func (a app) writeCurrentList(opts globalOptions, seen map[string]bool) error {
 	entries, err := os.ReadDir(opts.pinHome)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -332,14 +429,44 @@ func (a app) commandList(opts globalOptions) error {
 		if !entry.IsDir() {
 			continue
 		}
+		if seen[entry.Name()] {
+			continue
+		}
 		ctx := pinContext{name: entry.Name(), pinHome: opts.pinHome}
 		metadata, err := readCurrentMetadata(ctx)
 		if err != nil {
+			if _, ok, legacyErr := legacyContext(entry.Name(), opts); legacyErr == nil && ok {
+				continue
+			}
 			return err
 		}
 		if metadata == nil {
 			continue
 		}
+		seen[entry.Name()] = true
+		fmt.Fprintf(a.stdout, "%s\t%s\t%s\t%s\n", ctx.name, metadata.string("git_sha"), ctx.toolRoot(), ctx.currentLink())
+	}
+	return nil
+}
+
+func (a app) writeLegacyList(pinHome string, seen map[string]bool) error {
+	entries, err := os.ReadDir(pinHome)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() || seen[entry.Name()] {
+			continue
+		}
+		ctx := pinContext{name: entry.Name(), pinHome: pinHome}
+		metadata, ok, err := legacyMetadata(ctx)
+		if err != nil || !ok {
+			continue
+		}
+		seen[entry.Name()] = true
 		fmt.Fprintf(a.stdout, "%s\t%s\t%s\t%s\n", ctx.name, metadata.string("git_sha"), ctx.toolRoot(), ctx.currentLink())
 	}
 	return nil

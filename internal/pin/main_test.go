@@ -27,6 +27,24 @@ func runPin(t *testing.T, root string, args ...string) cliResult {
 	return cliResult{code: code, stdout: stdout.String(), stderr: stderr.String()}
 }
 
+func runPinWithHome(t *testing.T, home string, args ...string) cliResult {
+	t.Helper()
+	prepareToolEnv(t, home)
+	t.Setenv("HOME", home)
+	var stdout, stderr bytes.Buffer
+	code := RunCLI(args, &stdout, &stderr)
+	return cliResult{code: code, stdout: stdout.String(), stderr: stderr.String()}
+}
+
+func runPinWithPinHome(t *testing.T, root, pinHome string, args ...string) cliResult {
+	t.Helper()
+	prepareToolEnv(t, root)
+	var stdout, stderr bytes.Buffer
+	allArgs := append([]string{"--pin-home", pinHome}, args...)
+	code := RunCLI(allArgs, &stdout, &stderr)
+	return cliResult{code: code, stdout: stdout.String(), stderr: stderr.String()}
+}
+
 func runCompiledPin(t *testing.T, root string, args ...string) cliResult {
 	t.Helper()
 	prepareToolEnv(t, root)
@@ -294,6 +312,14 @@ func activeEntrypoint(root string) string {
 	return filepath.Join(root, "share", "demo-tool", "current", ".venv", "bin", "demo-tool")
 }
 
+func defaultHomeToolRoot(root string) string {
+	return filepath.Join(root, ".local", "share", "pin", "demo-tool")
+}
+
+func legacyHomeToolRoot(root string) string {
+	return filepath.Join(root, ".local", "share", "demo-tool")
+}
+
 func requireReleaseLink(t *testing.T, root, linkName, sha string) {
 	t.Helper()
 	target, err := filepath.EvalSymlinks(filepath.Join(root, "share", "demo-tool", linkName))
@@ -337,6 +363,98 @@ func requireReleaseMetadata(t *testing.T, root, sha string) {
 
 func TestUpdateStatusVerifyAndList(t *testing.T) {
 	testUpdateStatusVerifyAndList(t, runPin)
+}
+
+func TestDefaultPinHomeUsesNamespacedLayout(t *testing.T) {
+	root := t.TempDir()
+	repo, sha := sourceRepo(t, root)
+
+	result := runPinWithHome(t, root, "update", repo)
+	requireCode(t, result, 0)
+	requireContains(t, result.stdout, "updated: demo-tool "+sha)
+
+	release := filepath.Join(defaultHomeToolRoot(root), "releases", sha)
+	if info, err := os.Stat(release); err != nil || !info.IsDir() {
+		t.Fatalf("missing namespaced release: %s", release)
+	}
+	result = runPinWithHome(t, root, "status", "demo-tool")
+	requireCode(t, result, 0)
+	requireContains(t, result.stdout, "tool_root: "+defaultHomeToolRoot(root))
+
+	result = runPinWithHome(t, root, "list")
+	requireCode(t, result, 0)
+	requireContains(t, result.stdout, "demo-tool\t"+sha+"\t"+defaultHomeToolRoot(root))
+}
+
+func TestDefaultCommandsFallBackToLegacyLayout(t *testing.T) {
+	root := t.TempDir()
+	repo, oldSHA := sourceRepo(t, root)
+	legacyPinHome := filepath.Join(root, ".local", "share")
+
+	result := runPinWithPinHome(t, root, legacyPinHome, "update", repo)
+	requireCode(t, result, 0)
+	requireContains(t, result.stdout, "updated: demo-tool "+oldSHA)
+
+	result = runPinWithHome(t, root, "run", "demo-tool")
+	requireCode(t, result, 0)
+	if strings.TrimSpace(result.stdout) != "demo 1" {
+		t.Fatalf("run stdout = %q, want demo 1", result.stdout)
+	}
+	result = runPinWithHome(t, root, "list")
+	requireCode(t, result, 0)
+	requireContains(t, result.stdout, "demo-tool\t"+oldSHA+"\t"+legacyHomeToolRoot(root))
+
+	newSHA := commitToolVersion(t, repo, "2", false)
+	git(t, repo, "push")
+	result = runPinWithHome(t, root, "update", repo)
+	requireCode(t, result, 0)
+	requireContains(t, result.stdout, "current: "+filepath.Join(legacyHomeToolRoot(root), "current")+" -> releases/"+newSHA)
+	if _, err := os.Stat(filepath.Join(legacyHomeToolRoot(root), "releases", newSHA)); err != nil {
+		t.Fatalf("legacy release was not updated: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(defaultHomeToolRoot(root), "releases", newSHA)); !os.IsNotExist(err) {
+		t.Fatalf("update should not create a namespaced release when falling back to legacy layout")
+	}
+}
+
+func TestLegacyRepoPathFallbackUsesCurrentRepoConfig(t *testing.T) {
+	root := t.TempDir()
+	repo, oldSHA := sourceRepo(t, root)
+	legacyPinHome := filepath.Join(root, ".local", "share")
+
+	result := runPinWithPinHome(t, root, legacyPinHome, "update", repo)
+	requireCode(t, result, 0)
+	requireContains(t, result.stdout, "updated: demo-tool "+oldSHA)
+
+	movedRepo := filepath.Join(root, "moved-repo")
+	if err := os.Rename(repo, movedRepo); err != nil {
+		t.Fatal(err)
+	}
+	newSHA := commitToolVersion(t, movedRepo, "2", false)
+	git(t, movedRepo, "push")
+
+	result = runPinWithHome(t, root, "update", movedRepo)
+	requireCode(t, result, 0)
+	requireContains(t, result.stdout, "current: "+filepath.Join(legacyHomeToolRoot(root), "current")+" -> releases/"+newSHA)
+
+	metadataPath := filepath.Join(legacyHomeToolRoot(root), "releases", newSHA, ".pin", "release.json")
+	var metadata map[string]any
+	if err := json.Unmarshal([]byte(mustReadFile(t, metadataPath)), &metadata); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := metadata["source_path"].(string); got != movedRepo {
+		t.Fatalf("source_path = %q, want %q", got, movedRepo)
+	}
+}
+
+func TestLegacyFallbackIgnoresNonPinShareDirectory(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(legacyHomeToolRoot(root), "current"), "not a pin symlink\n")
+
+	result := runPinWithHome(t, root, "status", "demo-tool")
+	requireCode(t, result, 0)
+	requireContains(t, result.stdout, "installed: no")
+	requireContains(t, result.stdout, "tool_root: "+defaultHomeToolRoot(root))
 }
 
 func TestGlobalHelpPrintsUsageOnce(t *testing.T) {
@@ -615,6 +733,45 @@ func TestE2ECompiledBinaryReleaseEntrypoint(t *testing.T) {
 	if output != "demo 1" {
 		t.Fatalf("release entrypoint output = %q, want %q", output, "demo 1")
 	}
+}
+
+func TestRunExecutesActiveRelease(t *testing.T) {
+	root := t.TempDir()
+	repo, sha := sourceRepo(t, root)
+
+	result := runTool(t, runPin, root, repo, "update")
+	requireCode(t, result, 0)
+	requireContains(t, result.stdout, "updated: demo-tool "+sha)
+
+	result = runPin(t, root, "run", "demo-tool")
+	requireCode(t, result, 0)
+	if strings.TrimSpace(result.stdout) != "demo 1" {
+		t.Fatalf("run stdout = %q, want demo 1", result.stdout)
+	}
+}
+
+func TestRunPassesArgsAndUsesReleaseWorkingDirectory(t *testing.T) {
+	root := t.TempDir()
+	repo, _ := sourceRepo(t, root)
+	writeScriptTool(t, repo, "1")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-m", "switch to script tool")
+	git(t, repo, "push")
+
+	result := runTool(t, runPin, root, repo, "update")
+	requireCode(t, result, 0)
+
+	result = runPin(t, root, "run", "demo-tool", "--", "cron")
+	requireCode(t, result, 0)
+	if strings.TrimSpace(result.stdout) != "script 1 from-source cron" {
+		t.Fatalf("run stdout = %q, want script 1 from-source cron", result.stdout)
+	}
+}
+
+func TestRunRequiresSeparatorBeforeToolArgs(t *testing.T) {
+	result := runPin(t, t.TempDir(), "run", "demo-tool", "cron")
+	requireCode(t, result, 2)
+	requireContains(t, result.stderr, "run arguments must follow --")
 }
 
 func TestE2ECompiledBinaryPythonScriptLifecycle(t *testing.T) {

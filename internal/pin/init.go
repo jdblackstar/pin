@@ -18,20 +18,20 @@ type initOptions struct {
 	entrypoint   string
 	source       string
 	requirements string
-	inject       repeatedString
+	inject       repeatedStringFlag
 	branch       string
 	remote       string
-	preflight    repeatedString
-	verify       repeatedString
+	preflight    repeatedStringFlag
+	verify       repeatedStringFlag
 }
 
-type repeatedString []string
+type repeatedStringFlag []string
 
-func (values *repeatedString) String() string {
+func (values *repeatedStringFlag) String() string {
 	return strings.Join(*values, ", ")
 }
 
-func (values *repeatedString) Set(value string) error {
+func (values *repeatedStringFlag) Set(value string) error {
 	if value == "" {
 		return fmt.Errorf("command cannot be empty")
 	}
@@ -211,11 +211,11 @@ func validateOptionalRelativeInitPath(value, key string) (string, error) {
 	return validateRelativePath(value, fmt.Sprintf("%s key %q", configName, key))
 }
 
-func validateInjectPaths(values repeatedString) ([]string, error) {
+func validateInjectPaths(values repeatedStringFlag) ([]string, error) {
 	return validateRuntimePaths(values, "inject")
 }
 
-func validateRuntimePaths(values repeatedString, key string) ([]string, error) {
+func validateRuntimePaths(values repeatedStringFlag, key string) ([]string, error) {
 	if len(values) == 0 {
 		return nil, nil
 	}
@@ -253,7 +253,7 @@ func currentBranchOrDefault(sourcePath string) string {
 	return branch
 }
 
-func initCommands(raw repeatedString, fallback [][]string, key string) ([][]string, error) {
+func initCommands(raw repeatedStringFlag, fallback [][]string, key string) ([][]string, error) {
 	if len(raw) == 0 {
 		return fallback, nil
 	}

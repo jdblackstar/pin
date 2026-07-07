@@ -1,6 +1,7 @@
 package pin
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -69,7 +70,7 @@ func (ctx pinContext) previousLink() string {
 	return filepath.Join(ctx.toolRoot(), "previous")
 }
 
-func resolveContext(toolOrPath string, hasArg bool, pinHome string) (pinContext, error) {
+func resolveContext(toolOrPath string, hasArg bool, opts globalOptions) (pinContext, error) {
 	var candidate string
 	if !hasArg {
 		wd, err := os.Getwd()
@@ -94,19 +95,36 @@ func resolveContext(toolOrPath string, hasArg bool, pinHome string) (pinContext,
 		if err != nil {
 			return pinContext{}, err
 		}
-		return pinContext{config.name, pinHome, config}, nil
+		ctx := pinContext{config.name, opts.pinHome, config}
+		metadata, err := readMetadataForTool(opts.pinHome, ctx.name)
+		if err != nil {
+			return pinContext{}, err
+		}
+		if metadata == nil {
+			if ok, err := legacyInstallExists(ctx.name, opts); err != nil || ok {
+				if err != nil {
+					return pinContext{}, err
+				}
+				ctx.pinHome = opts.legacyPinHome
+			}
+		}
+		return ctx, nil
 	}
 
 	name, err := validatePathSegment(toolOrPath, "tool name")
 	if err != nil {
 		return pinContext{}, err
 	}
-	ctx := pinContext{name: name, pinHome: pinHome}
-	metadata, err := readMetadataForTool(pinHome, name)
+	ctx := pinContext{name: name, pinHome: opts.pinHome}
+	metadata, err := readMetadataForTool(opts.pinHome, name)
 	if err != nil {
 		return pinContext{}, err
 	}
-	if metadata != nil {
+	if metadata == nil {
+		if legacy, ok, err := legacyContext(name, opts); err != nil || ok {
+			return legacy, err
+		}
+	} else {
 		config, err := loadConfigFromMetadata(metadata)
 		if err != nil {
 			return pinContext{}, err
@@ -114,6 +132,77 @@ func resolveContext(toolOrPath string, hasArg bool, pinHome string) (pinContext,
 		ctx.config = config
 	}
 	return ctx, nil
+}
+
+func legacyContext(name string, opts globalOptions) (pinContext, bool, error) {
+	if opts.legacyPinHome == "" {
+		return pinContext{}, false, nil
+	}
+	if filepath.Clean(opts.legacyPinHome) == filepath.Clean(opts.pinHome) {
+		return pinContext{}, false, nil
+	}
+	ctx := pinContext{name: name, pinHome: opts.legacyPinHome}
+	metadata, ok, err := legacyMetadata(ctx)
+	if err != nil || !ok {
+		return pinContext{}, ok, err
+	}
+	config, err := loadConfigFromMetadata(metadata)
+	if err != nil {
+		return pinContext{}, true, err
+	}
+	ctx.config = config
+	return ctx, true, nil
+}
+
+func legacyInstallExists(name string, opts globalOptions) (bool, error) {
+	if opts.legacyPinHome == "" {
+		return false, nil
+	}
+	if filepath.Clean(opts.legacyPinHome) == filepath.Clean(opts.pinHome) {
+		return false, nil
+	}
+	ctx := pinContext{name: name, pinHome: opts.legacyPinHome}
+	_, ok, err := legacyMetadata(ctx)
+	return ok, err
+}
+
+func legacyMetadata(ctx pinContext) (releaseMetadata, bool, error) {
+	ok, err := legacyLayoutExists(ctx)
+	if err != nil || !ok {
+		return nil, ok, err
+	}
+	metadata, err := readCurrentMetadata(ctx)
+	if err != nil {
+		return nil, true, err
+	}
+	if metadata == nil {
+		return nil, false, nil
+	}
+	if metadata.string("tool") != ctx.name {
+		return nil, true, fmt.Errorf("legacy metadata tool %q does not match %q", metadata.string("tool"), ctx.name)
+	}
+	return metadata, true, nil
+}
+
+func legacyLayoutExists(ctx pinContext) (bool, error) {
+	releases, err := os.Stat(ctx.releasesDir())
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	if !releases.IsDir() {
+		return false, nil
+	}
+	current, err := os.Lstat(ctx.currentLink())
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	return current.Mode()&os.ModeSymlink != 0, nil
 }
 
 func findConfig(path string) (string, bool) {

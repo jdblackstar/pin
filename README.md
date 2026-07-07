@@ -19,14 +19,14 @@ brew install jdblackstar/tap/pin
 - reads a repo-local `pin.toml`
 - verifies the checkout is clean and matches the configured remote branch
 - runs optional preflight commands
-- builds a new release under `~/.local/share/<tool>/releases/<git-sha>/`
+- builds a new release under `~/.local/share/pin/<tool>/releases/<git-sha>/`
 - injects optional untracked runtime paths into the release
 - creates a Python virtual environment at `.venv/` inside that release
 - verifies the candidate before activation
 - atomically updates `current` and `previous` symlinks
 
-That stable `current` directory is the path your cron job, launchd job, or agent
-should use as its runtime checkout.
+`pin run <tool>` resolves that stable `current` directory and runs the active
+entrypoint from inside the release checkout.
 
 ## Quickstart
 
@@ -55,7 +55,7 @@ pin update /path/to/daily-report-repo
 Point automation at the stable current release:
 
 ```cron
-15 8 * * * cd /Users/you/.local/share/daily-report/current && ./.venv/bin/daily-report
+15 8 * * * pin run daily-report
 ```
 
 Future updates are the same command after merging to `main`:
@@ -122,8 +122,15 @@ pin update /path/to/daily-report-repo
 After a successful update, run it from:
 
 ```bash
-cd ~/.local/share/daily-report/current
+cd ~/.local/share/pin/daily-report/current
 ./.venv/bin/daily-report
+```
+
+Or let `pin` resolve the active release and run the entrypoint:
+
+```bash
+pin run daily-report
+pin run daily-report -- --verbose
 ```
 
 ## Python Package Example
@@ -173,13 +180,13 @@ creates a symlink at the same path inside the archived release checkout, backed
 by stable storage under the tool's pin home:
 
 ```text
-~/.local/share/<tool>/releases/<git-sha>/tokens -> ../../shared/tokens
-~/.local/share/<tool>/releases/<git-sha>/.env -> ../../shared/.env
+~/.local/share/pin/<tool>/releases/<git-sha>/tokens -> ../../shared/tokens
+~/.local/share/pin/<tool>/releases/<git-sha>/.env -> ../../shared/.env
 ```
 
 On the first update, if the shared backing path does not exist yet and the same
 gitignored path exists in the mutable source checkout, `pin` copies it into
-`shared/` once. After that, `~/.local/share/<tool>/shared/<path>` is the
+`shared/` once. After that, `~/.local/share/pin/<tool>/shared/<path>` is the
 authoritative runtime location. Future releases and rollbacks keep using the
 same injected state.
 
@@ -200,7 +207,7 @@ Release directories are laid out like normal checkouts of the pinned commit, wit
 runtime files added alongside the repo contents:
 
 ```text
-~/.local/share/<tool>/
+~/.local/share/pin/<tool>/
   current -> releases/<git-sha>
   previous -> releases/<old-sha>
   shared/
@@ -228,12 +235,17 @@ pin check [tool_or_path]
 pin update [tool_or_path]
 pin verify [tool_or_path]
 pin rollback [tool_or_path]
+pin run tool [-- args...]
 pin list
 ```
 
 `tool_or_path` can be either a repo path containing `pin.toml` or an installed
 tool name. Commands that need source state, such as `update` and `check`, need
 the config from the repo path or from release metadata.
+
+By default, new installs live under `~/.local/share/pin/<tool>`. Existing
+installs from older versions under `~/.local/share/<tool>` remain supported and
+are used when no namespaced install exists.
 
 ## Safety Model
 

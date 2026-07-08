@@ -1,4 +1,4 @@
-package pin
+package app
 
 import (
 	"bytes"
@@ -50,7 +50,7 @@ func runCompiledPin(t *testing.T, root string, args ...string) cliResult {
 	prepareToolEnv(t, root)
 	bin := filepath.Join(root, "pin")
 	if _, err := os.Stat(bin); err != nil {
-		run(t, "", "go", "build", "-o", bin, "../..")
+		run(t, "", "go", "build", "-o", bin, "..")
 	}
 	allArgs := append([]string{"--pin-home", filepath.Join(root, "share")}, args...)
 	command := exec.Command(bin, allArgs...)

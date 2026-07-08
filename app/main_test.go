@@ -493,6 +493,16 @@ func TestLegacyFallbackIgnoresNonPinShareDirectory(t *testing.T) {
 	requireContains(t, result.stdout, "tool_root: "+defaultHomeToolRoot(root))
 }
 
+func TestMissingPathLikeContextReportsPathDoesNotExist(t *testing.T) {
+	root := t.TempDir()
+	missingAbsolute := filepath.Join(root, "missing")
+	for _, arg := range []string{missingAbsolute, filepath.Join("missing", "repo")} {
+		result := runPin(t, root, "status", arg)
+		requireCode(t, result, 2)
+		requireContains(t, result.stderr, "path does not exist: "+filepath.Clean(arg))
+	}
+}
+
 func TestGlobalHelpPrintsUsageOnce(t *testing.T) {
 	result := runPin(t, t.TempDir(), "--help")
 	requireCode(t, result, 0)

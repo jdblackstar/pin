@@ -115,6 +115,10 @@ func resolveContext(toolOrPath string, hasArg bool, opts globalOptions) (pinCont
 		return ctx, nil
 	}
 
+	if looksLikePath(toolOrPath) {
+		return pinContext{}, fmt.Errorf("path does not exist: %s", candidate)
+	}
+
 	name, err := validatePathSegment(toolOrPath, "tool name")
 	if err != nil {
 		return pinContext{}, err
@@ -613,6 +617,18 @@ func validatePathSegment(value, label string) (string, error) {
 		return "", fmt.Errorf("%s must be a single path segment", label)
 	}
 	return value, nil
+}
+
+func looksLikePath(value string) bool {
+	if filepath.IsAbs(value) {
+		return true
+	}
+	for i := 0; i < len(value); i++ {
+		if os.IsPathSeparator(value[i]) {
+			return true
+		}
+	}
+	return false
 }
 
 func validateRelativePath(value, label string) (string, error) {

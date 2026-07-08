@@ -54,7 +54,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="${{ steps.tag.outputs.value }}"
-          for target in aarch64-apple-darwin x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+          for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
             gh release download "$tag" \
               --repo jdblackstar/pin \
               --pattern "pin_${tag}_${target}.tar.gz.sha256"
@@ -65,7 +65,7 @@ jobs:
         id: sha
         run: |
           tag="${{ steps.tag.outputs.value }}"
-          for target in aarch64-apple-darwin x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+          for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
             key=$(echo "$target" | tr '-' '_')
             hash=$(awk '{print $1}' "pin_${tag}_${target}.tar.gz.sha256")
             echo "${key}=${hash}" >> "$GITHUB_OUTPUT"
@@ -87,6 +87,10 @@ jobs:
               on_arm do
                 url "https://github.com/jdblackstar/pin/releases/download/${tag}/pin_${tag}_aarch64-apple-darwin.tar.gz"
                 sha256 "${{ steps.sha.outputs.aarch64_apple_darwin }}"
+              end
+              on_intel do
+                url "https://github.com/jdblackstar/pin/releases/download/${tag}/pin_${tag}_x86_64-apple-darwin.tar.gz"
+                sha256 "${{ steps.sha.outputs.x86_64_apple_darwin }}"
               end
             end
 

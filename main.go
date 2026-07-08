@@ -3,9 +3,9 @@ package main
 import (
 	"os"
 
-	"github.com/jdblackstar/pin/internal/pin"
+	"github.com/jdblackstar/pin/app"
 )
 
 func main() {
-	os.Exit(pin.RunCLI(os.Args[1:], os.Stdout, os.Stderr))
+	os.Exit(app.RunCLI(os.Args[1:], os.Stdout, os.Stderr))
 }

@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/debug"
+	"strings"
 )
 
 type app struct {
@@ -18,9 +20,12 @@ type app struct {
 type globalOptions struct {
 	pinHome       string
 	legacyPinHome string
+	showVersion   bool
 }
 
 var errHelp = errors.New("help requested")
+
+var version = "dev"
 
 func RunCLI(args []string, stdout, stderr io.Writer) int {
 	a := app{stdout: stdout, stderr: stderr}
@@ -42,6 +47,10 @@ func (a app) run(args []string) error {
 	opts, rest, err := parseGlobalOptions(args, a.stdout)
 	if err != nil {
 		return err
+	}
+	if opts.showVersion {
+		printVersion(a.stdout)
+		return nil
 	}
 	if len(rest) == 0 {
 		printUsage(a.stdout)
@@ -83,6 +92,12 @@ func (a app) run(args []string) error {
 			return fmt.Errorf("list takes no arguments")
 		}
 		return a.commandList(opts)
+	case "version":
+		if len(commandArgs) != 0 {
+			return fmt.Errorf("version takes no arguments")
+		}
+		printVersion(a.stdout)
+		return nil
 	default:
 		return fmt.Errorf("unknown command %q", command)
 	}
@@ -110,6 +125,7 @@ func parseGlobalOptions(args []string, stdout io.Writer) (globalOptions, []strin
 	flags := flag.NewFlagSet("pin", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	flags.StringVar(&opts.pinHome, "pin-home", opts.pinHome, "")
+	flags.BoolVar(&opts.showVersion, "version", false, "")
 	flags.Usage = func() { printUsage(stdout) }
 
 	if err := flags.Parse(args); err != nil {
@@ -143,7 +159,7 @@ func optionalSingleArg(command string, args []string) (string, bool, error) {
 }
 
 func printUsage(w io.Writer) {
-	fmt.Fprintln(w, "Usage: pin [--pin-home PATH] <command> [tool_or_path]")
+	fmt.Fprintln(w, "Usage: pin [--pin-home PATH] [--version] <command> [tool_or_path]")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Commands:")
 	fmt.Fprintln(w, "  init [path]")
@@ -154,6 +170,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  rollback [tool_or_path]")
 	fmt.Fprintln(w, "  run tool [-- args...]")
 	fmt.Fprintln(w, "  list")
+	fmt.Fprintln(w, "  version")
 }
 
 func printCommandUsage(w io.Writer, command string) {
@@ -166,9 +183,27 @@ func printCommandUsage(w io.Writer, command string) {
 		fmt.Fprintln(w, "Usage: pin run tool [-- args...]")
 	case "list":
 		fmt.Fprintln(w, "Usage: pin list")
+	case "version":
+		fmt.Fprintln(w, "Usage: pin version")
 	default:
 		printUsage(w)
 	}
+}
+
+func printVersion(w io.Writer) {
+	fmt.Fprintf(w, "pin %s\n", Version())
+}
+
+func Version() string {
+	if version != "" && version != "dev" {
+		return strings.TrimPrefix(version, "v")
+	}
+	if info, ok := debug.ReadBuildInfo(); ok {
+		if info.Main.Version != "" && info.Main.Version != "(devel)" {
+			return strings.TrimPrefix(info.Main.Version, "v")
+		}
+	}
+	return version
 }
 
 func isHelp(arg string) bool {

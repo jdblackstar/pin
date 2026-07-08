@@ -73,7 +73,7 @@ func (a app) run(args []string) error {
 		if err != nil {
 			return err
 		}
-		ctx, err := resolveContext(toolOrPath, true, opts)
+		ctx, err := resolveToolContext(toolOrPath, opts)
 		if err != nil {
 			return err
 		}

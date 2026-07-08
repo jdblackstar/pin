@@ -115,7 +115,11 @@ func resolveContext(toolOrPath string, hasArg bool, opts globalOptions) (pinCont
 		return ctx, nil
 	}
 
-	name, err := validatePathSegment(toolOrPath, "tool name")
+	return resolveToolContext(toolOrPath, opts)
+}
+
+func resolveToolContext(tool string, opts globalOptions) (pinContext, error) {
+	name, err := validatePathSegment(tool, "tool name")
 	if err != nil {
 		return pinContext{}, err
 	}

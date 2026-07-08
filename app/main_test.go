@@ -524,6 +524,35 @@ func TestGlobalHelpPrintsUsageOnce(t *testing.T) {
 	if got := strings.Count(result.stdout, "Usage: pin "); got != 1 {
 		t.Fatalf("usage count = %d, want 1\nstdout:\n%s", got, result.stdout)
 	}
+	requireContains(t, result.stdout, "  version")
+}
+
+func TestVersionCommandAndFlagPrintVersion(t *testing.T) {
+	original := version
+	version = "v1.2.3"
+	t.Cleanup(func() { version = original })
+
+	for name, args := range map[string][]string{
+		"command": {"version"},
+		"flag":    {"--version"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			result := runPin(t, t.TempDir(), args...)
+			requireCode(t, result, 0)
+			if result.stdout != "pin 1.2.3\n" {
+				t.Fatalf("stdout = %q, want %q", result.stdout, "pin 1.2.3\n")
+			}
+			if result.stderr != "" {
+				t.Fatalf("stderr = %q, want empty", result.stderr)
+			}
+		})
+	}
+}
+
+func TestVersionCommandRejectsArguments(t *testing.T) {
+	result := runPin(t, t.TempDir(), "version", "extra")
+	requireCode(t, result, 2)
+	requireContains(t, result.stderr, "version takes no arguments")
 }
 
 func TestInitCreatesDefaultConfig(t *testing.T) {

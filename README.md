@@ -237,6 +237,8 @@ pin verify [tool_or_path]
 pin rollback [tool_or_path]
 pin run tool [-- args...]
 pin list
+pin --version
+pin version
 ```
 
 `tool_or_path` can be either a repo path containing `pin.toml` or an installed

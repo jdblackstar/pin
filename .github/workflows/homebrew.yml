@@ -110,7 +110,7 @@ jobs:
             end
 
             test do
-              system bin/"pin", "--help"
+              system bin/"pin", "--version"
             end
           end
           FORMULA

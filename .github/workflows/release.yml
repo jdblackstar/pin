@@ -46,7 +46,8 @@ jobs:
           CGO_ENABLED: "0"
         run: |
           mkdir -p dist
-          go build -trimpath -ldflags "-s -w" -o "dist/pin" .
+          version="${GITHUB_REF_NAME#v}"
+          go build -trimpath -ldflags "-s -w -X github.com/jdblackstar/pin/app.version=${version}" -o "dist/pin" .
       - name: Package
         run: |
           set -euo pipefail
@@ -97,7 +98,8 @@ jobs:
           CGO_ENABLED: "0"
         run: |
           mkdir -p dist
-          go build -trimpath -ldflags "-s -w" -o "dist/pin" .
+          version="${GITHUB_REF_NAME#v}"
+          go build -trimpath -ldflags "-s -w -X github.com/jdblackstar/pin/app.version=${version}" -o "dist/pin" .
       - name: Package
         run: |
           set -euo pipefail
@@ -145,7 +147,8 @@ jobs:
           CGO_ENABLED: "0"
         run: |
           mkdir -p dist
-          go build -trimpath -ldflags "-s -w" -o "dist/pin.exe" .
+          version="${GITHUB_REF_NAME#v}"
+          go build -trimpath -ldflags "-s -w -X github.com/jdblackstar/pin/app.version=${version}" -o "dist/pin.exe" .
       - name: Package
         run: |
           set -euo pipefail

@@ -152,7 +152,7 @@ func readReleaseMetadata(release string) (releaseMetadata, error) {
 	return releaseMetadata(metadata), nil
 }
 
-func writeReleaseMetadata(release string, config config, sha string) error {
+func writeReleaseMetadata(release, metadataReleasePath string, config config, sha string) error {
 	metadata := releaseMetadata{
 		"schema_version": schemaVersion,
 		"tool":           config.name,
@@ -162,7 +162,7 @@ func writeReleaseMetadata(release string, config config, sha string) error {
 		"branch":         config.branch,
 		"remote":         config.remote,
 		"installed_at":   time.Now().UTC().Format(time.RFC3339Nano),
-		"release_path":   release,
+		"release_path":   metadataReleasePath,
 		"config":         config.raw,
 	}
 	metadataPath := filepath.Join(release, metadataDir, metadataName)
@@ -224,6 +224,12 @@ func updateRelease(ctx pinContext) (updateReport, error) {
 	if err != nil {
 		return updateReport{}, err
 	}
+	lock, err := acquireToolLock(ctx)
+	if err != nil {
+		return updateReport{}, err
+	}
+	defer lock.release()
+
 	sha, err := sourceSHAForUpdate(*config)
 	if err != nil {
 		return updateReport{}, err
@@ -257,6 +263,12 @@ func updateRelease(ctx pinContext) (updateReport, error) {
 }
 
 func rollbackRelease(ctx pinContext) (rollbackReport, error) {
+	lock, err := acquireToolLock(ctx)
+	if err != nil {
+		return rollbackReport{}, err
+	}
+	defer lock.release()
+
 	previousTarget, err := previousRelease(ctx)
 	if err != nil {
 		return rollbackReport{}, err
@@ -367,18 +379,36 @@ func buildRelease(ctx pinContext, config config, sha string) (string, error) {
 		}
 		return "", fmt.Errorf("release already exists: %s", final)
 	}
-	if err := os.MkdirAll(final, 0o755); err != nil {
+	temp, err := os.MkdirTemp(ctx.releasesDir(), "."+sha+".tmp-")
+	if err != nil {
 		return "", err
 	}
 
+	if err := cleanupOnError(temp, func() error {
+		return runSteps(
+			releaseStep{"extract source", func() error { return extractGitArchive(config.sourcePath, sha, temp) }},
+			releaseStep{"check runtime paths", func() error { return ensureRuntimePathsAvailable(temp) }},
+			releaseStep{"inject runtime paths", func() error { return injectRuntimePaths(ctx, temp, config) }},
+		)
+	}); err != nil {
+		return "", err
+	}
+	if exists, err := directoryExists(final); err != nil || exists {
+		_ = os.RemoveAll(temp)
+		if err != nil {
+			return "", err
+		}
+		return "", fmt.Errorf("release already exists: %s", final)
+	}
+	if err := os.Rename(temp, final); err != nil {
+		_ = os.RemoveAll(temp)
+		return "", err
+	}
 	if err := cleanupOnError(final, func() error {
 		return runSteps(
-			releaseStep{"extract source", func() error { return extractGitArchive(config.sourcePath, sha, final) }},
-			releaseStep{"check runtime paths", func() error { return ensureRuntimePathsAvailable(final) }},
-			releaseStep{"inject runtime paths", func() error { return injectRuntimePaths(ctx, final, config) }},
 			releaseStep{"create virtualenv", func() error { return createVenv(final) }},
 			releaseStep{"install python runtime", func() error { return installPythonRuntime(final, final, config) }},
-			releaseStep{"write metadata", func() error { return writeReleaseMetadata(final, config, sha) }},
+			releaseStep{"write metadata", func() error { return writeReleaseMetadata(final, final, config, sha) }},
 		)
 	}); err != nil {
 		return "", err

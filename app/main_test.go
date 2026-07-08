@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 type cliResult struct {
@@ -361,6 +362,20 @@ func requireReleaseMetadata(t *testing.T, root, sha string) {
 	}
 }
 
+func requireNoTemporaryReleaseDirs(t *testing.T, root string) {
+	t.Helper()
+	releases := filepath.Join(root, "share", "demo-tool", "releases")
+	entries, err := os.ReadDir(releases)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.Contains(entry.Name(), ".tmp-") {
+			t.Fatalf("temporary release directory was not cleaned up: %s", filepath.Join(releases, entry.Name()))
+		}
+	}
+}
+
 func TestUpdateStatusVerifyAndList(t *testing.T) {
 	testUpdateStatusVerifyAndList(t, runPin)
 }
@@ -616,6 +631,7 @@ func testUpdateStatusVerifyAndList(t *testing.T, runner pinRunner) {
 	if _, err := os.Stat(filepath.Join(release, "src")); !os.IsNotExist(err) {
 		t.Fatalf("release should not contain nested src directory: %s", filepath.Join(release, "src"))
 	}
+	requireNoTemporaryReleaseDirs(t, root)
 	currentTarget, err := filepath.EvalSymlinks(filepath.Join(root, "share", "demo-tool", "current"))
 	if err != nil {
 		t.Fatal(err)
@@ -1593,4 +1609,65 @@ func TestRollbackSwapsCurrentAndPrevious(t *testing.T) {
 	if filepath.Base(previous) != newSHA {
 		t.Fatalf("previous = %s, want %s", filepath.Base(previous), newSHA)
 	}
+}
+
+func TestToolLockSerializesSameToolRoot(t *testing.T) {
+	root := t.TempDir()
+	ctx := pinContext{name: "demo-tool", pinHome: filepath.Join(root, "share")}
+
+	first, err := acquireToolLock(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	acquired := make(chan *toolLock, 1)
+	failed := make(chan error, 1)
+	go func() {
+		second, err := acquireToolLock(ctx)
+		if err != nil {
+			failed <- err
+			return
+		}
+		acquired <- second
+	}()
+
+	select {
+	case second := <-acquired:
+		second.release()
+		first.release()
+		t.Fatal("second lock acquired while first lock was still held")
+	case err := <-failed:
+		first.release()
+		t.Fatalf("second lock failed: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	first.release()
+
+	select {
+	case second := <-acquired:
+		second.release()
+	case err := <-failed:
+		t.Fatalf("second lock failed after release: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("second lock did not acquire after first lock released")
+	}
+}
+
+func TestToolLockDoesNotBlockDifferentToolRoots(t *testing.T) {
+	root := t.TempDir()
+	firstCtx := pinContext{name: "demo-tool", pinHome: filepath.Join(root, "share")}
+	secondCtx := pinContext{name: "other-tool", pinHome: filepath.Join(root, "share")}
+
+	first, err := acquireToolLock(firstCtx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.release()
+
+	second, err := acquireToolLock(secondCtx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second.release()
 }

@@ -812,6 +812,27 @@ func TestRunExecutesActiveRelease(t *testing.T) {
 	}
 }
 
+func TestRunResolvesToolNameBeforeLocalPath(t *testing.T) {
+	root := t.TempDir()
+	repo, sha := sourceRepo(t, root)
+
+	result := runTool(t, runPin, root, repo, "update")
+	requireCode(t, result, 0)
+	requireContains(t, result.stdout, "updated: demo-tool "+sha)
+
+	cwd := filepath.Join(root, "cwd")
+	if err := os.MkdirAll(filepath.Join(cwd, "demo-tool"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(cwd)
+
+	result = runPin(t, root, "run", "demo-tool")
+	requireCode(t, result, 0)
+	if strings.TrimSpace(result.stdout) != "demo 1" {
+		t.Fatalf("run stdout = %q, want demo 1", result.stdout)
+	}
+}
+
 func TestRunPassesArgsAndUsesReleaseWorkingDirectory(t *testing.T) {
 	root := t.TempDir()
 	repo, _ := sourceRepo(t, root)

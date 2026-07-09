@@ -239,15 +239,12 @@ func updateRelease(ctx pinContext) (updateReport, error) {
 		return updateReport{}, err
 	}
 
-	err = runSteps(
+	if err := runSteps(
 		releaseStep{"verify release", func() error { return verifyRelease(ctx, release, false) }},
-		releaseStep{"activate release", func() error { return activateRelease(ctx, sha) }},
-		releaseStep{"verify active release", func() error {
-			_, err := verifyActive(ctx)
-			return err
-		}},
-	)
-	if err != nil {
+	); err != nil {
+		return updateReport{}, err
+	}
+	if err := activateAndVerifyRelease(ctx, sha, "activate release"); err != nil {
 		return updateReport{}, err
 	}
 
@@ -275,15 +272,12 @@ func rollbackRelease(ctx pinContext) (rollbackReport, error) {
 	}
 	previousSHA := filepath.Base(previousTarget)
 
-	err = runSteps(
+	if err := runSteps(
 		releaseStep{"verify previous release", func() error { return verifyRelease(ctx, previousTarget, false) }},
-		releaseStep{"activate previous release", func() error { return activateRelease(ctx, previousSHA) }},
-		releaseStep{"verify active release", func() error {
-			_, err := verifyActive(ctx)
-			return err
-		}},
-	)
-	if err != nil {
+	); err != nil {
+		return rollbackReport{}, err
+	}
+	if err := activateAndVerifyRelease(ctx, previousSHA, "activate previous release"); err != nil {
 		return rollbackReport{}, err
 	}
 
@@ -956,6 +950,93 @@ func validateMetadata(ctx pinContext, release string, metadata releaseMetadata, 
 		return fmt.Errorf("metadata branch/remote does not match config")
 	}
 	return nil
+}
+
+type symlinkSnapshot struct {
+	path   string
+	target string
+	exists bool
+}
+
+type releaseLinkSnapshot struct {
+	current  symlinkSnapshot
+	previous symlinkSnapshot
+}
+
+func activateAndVerifyRelease(ctx pinContext, sha, activationStep string) error {
+	links, err := captureReleaseLinks(ctx)
+	if err != nil {
+		return fmt.Errorf("capture release links: %w", err)
+	}
+
+	err = runSteps(
+		releaseStep{activationStep, func() error { return activateRelease(ctx, sha) }},
+		releaseStep{"verify active release", func() error {
+			_, err := verifyActive(ctx)
+			return err
+		}},
+	)
+	if err == nil {
+		return nil
+	}
+	if restoreErr := links.restore(); restoreErr != nil {
+		return errors.Join(err, fmt.Errorf("restore release links: %w", restoreErr))
+	}
+	return err
+}
+
+func captureReleaseLinks(ctx pinContext) (releaseLinkSnapshot, error) {
+	current, err := captureSymlink(ctx.currentLink())
+	if err != nil {
+		return releaseLinkSnapshot{}, err
+	}
+	previous, err := captureSymlink(ctx.previousLink())
+	if err != nil {
+		return releaseLinkSnapshot{}, err
+	}
+	return releaseLinkSnapshot{current: current, previous: previous}, nil
+}
+
+func captureSymlink(path string) (symlinkSnapshot, error) {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return symlinkSnapshot{path: path}, nil
+	}
+	if err != nil {
+		return symlinkSnapshot{}, err
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		return symlinkSnapshot{}, fmt.Errorf("%s exists but is not a symlink", path)
+	}
+	target, err := os.Readlink(path)
+	if err != nil {
+		return symlinkSnapshot{}, err
+	}
+	return symlinkSnapshot{path: path, target: target, exists: true}, nil
+}
+
+func (snapshot releaseLinkSnapshot) restore() error {
+	return errors.Join(
+		restoreSymlink(snapshot.previous),
+		restoreSymlink(snapshot.current),
+	)
+}
+
+func restoreSymlink(snapshot symlinkSnapshot) error {
+	if snapshot.exists {
+		return replaceSymlink(snapshot.path, snapshot.target)
+	}
+	info, err := os.Lstat(snapshot.path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		return fmt.Errorf("cannot restore missing symlink because %s is not a symlink", snapshot.path)
+	}
+	return os.Remove(snapshot.path)
 }
 
 func activateRelease(ctx pinContext, sha string) error {

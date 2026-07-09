@@ -234,6 +234,9 @@ func replaceInFile(t *testing.T, path, old, new string) {
 		t.Fatal(err)
 	}
 	updated := strings.Replace(string(data), old, new, 1)
+	if updated == string(data) {
+		t.Fatalf("replacement target not found in %s", path)
+	}
 	if err := os.WriteFile(path, []byte(updated), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -374,6 +377,41 @@ func requireNoTemporaryReleaseDirs(t *testing.T, root string) {
 			t.Fatalf("temporary release directory was not cleaned up: %s", filepath.Join(releases, entry.Name()))
 		}
 	}
+}
+
+func activeVerificationScript(currentLink, message string) string {
+	encodedLink, _ := json.Marshal(currentLink)
+	encodedMessage, _ := json.Marshal(message)
+	return "from pathlib import Path; import sys; active = Path(" + string(encodedLink) + ").resolve() == Path.cwd().resolve(); sys.stderr.write(" + string(encodedMessage) + " if active else ''); raise SystemExit(9 if active else 0)"
+}
+
+func setRepoVerifyToFailWhenActive(t *testing.T, repo, currentLink, message string) {
+	t.Helper()
+	script, _ := json.Marshal(activeVerificationScript(currentLink, message))
+	replaceInFile(
+		t,
+		filepath.Join(repo, "pin.toml"),
+		`verify = ["demo-tool"]`,
+		`verify = [["python3", "-c", `+string(script)+`]]`,
+	)
+}
+
+func setReleaseVerifyToFailWhenActive(t *testing.T, metadataPath, currentLink, message string) {
+	t.Helper()
+	var metadata map[string]any
+	if err := json.Unmarshal([]byte(mustReadFile(t, metadataPath)), &metadata); err != nil {
+		t.Fatal(err)
+	}
+	config, ok := metadata["config"].(map[string]any)
+	if !ok {
+		t.Fatalf("metadata config is missing or invalid: %#v", metadata["config"])
+	}
+	config["verify"] = [][]string{{"python3", "-c", activeVerificationScript(currentLink, message)}}
+	data, err := json.MarshalIndent(metadata, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, metadataPath, string(data)+"\n")
 }
 
 func TestUpdateStatusVerifyAndList(t *testing.T) {
@@ -1366,6 +1404,92 @@ func TestE2ECompiledBinaryVerifyFailureDoesNotActivateRelease(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(root, "share", "demo-tool", "releases", newSHA)); err != nil {
 		t.Fatalf("failed candidate release should remain inspectable: %v", err)
 	}
+}
+
+func TestFirstUpdateRestoresLinksWhenActiveVerificationFails(t *testing.T) {
+	root := t.TempDir()
+	repo, _ := sourceRepo(t, root)
+	currentLink := filepath.Join(root, "share", "demo-tool", "current")
+	previousLink := filepath.Join(root, "share", "demo-tool", "previous")
+	setRepoVerifyToFailWhenActive(t, repo, currentLink, "active verify boom")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-m", "fail active verification")
+	sha := git(t, repo, "rev-parse", "HEAD")
+	git(t, repo, "push")
+
+	result := runTool(t, runPin, root, repo, "update")
+	requireCode(t, result, 2)
+	requireContains(t, result.stderr, "verify active release")
+	requireContains(t, result.stderr, "active verify boom")
+	for _, link := range []string{currentLink, previousLink} {
+		if _, err := os.Lstat(link); !os.IsNotExist(err) {
+			t.Fatalf("release link exists after failed first activation: %s", link)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(root, "share", "demo-tool", "releases", sha)); err != nil {
+		t.Fatalf("failed candidate release should remain inspectable: %v", err)
+	}
+}
+
+func TestUpdateRestoresLinksWhenActiveVerificationFails(t *testing.T) {
+	root := t.TempDir()
+	repo, oldSHA := sourceRepo(t, root)
+	if result := runTool(t, runPin, root, repo, "update"); result.code != 0 {
+		t.Fatalf("first update failed: %s", result.stderr)
+	}
+
+	currentSHA := commitToolVersion(t, repo, "2", false)
+	git(t, repo, "push")
+	if result := runTool(t, runPin, root, repo, "update"); result.code != 0 {
+		t.Fatalf("second update failed: %s", result.stderr)
+	}
+	requireReleaseLink(t, root, "current", currentSHA)
+	requireReleaseLink(t, root, "previous", oldSHA)
+
+	writeTool(t, repo, "3")
+	currentLink := filepath.Join(root, "share", "demo-tool", "current")
+	setRepoVerifyToFailWhenActive(t, repo, currentLink, "active update boom")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-m", "fail active verification")
+	failedSHA := git(t, repo, "rev-parse", "HEAD")
+	git(t, repo, "push")
+
+	result := runTool(t, runPin, root, repo, "update")
+	requireCode(t, result, 2)
+	requireContains(t, result.stderr, "verify active release")
+	requireContains(t, result.stderr, "active update boom")
+	requireReleaseLink(t, root, "current", currentSHA)
+	requireReleaseLink(t, root, "previous", oldSHA)
+	requireInstalledVersion(t, root, "2")
+	if _, err := os.Stat(filepath.Join(root, "share", "demo-tool", "releases", failedSHA)); err != nil {
+		t.Fatalf("failed candidate release should remain inspectable: %v", err)
+	}
+}
+
+func TestRollbackRestoresLinksWhenActiveVerificationFails(t *testing.T) {
+	root := t.TempDir()
+	repo, oldSHA := sourceRepo(t, root)
+	if result := runTool(t, runPin, root, repo, "update"); result.code != 0 {
+		t.Fatalf("first update failed: %s", result.stderr)
+	}
+
+	currentSHA := commitToolVersion(t, repo, "2", false)
+	git(t, repo, "push")
+	if result := runTool(t, runPin, root, repo, "update"); result.code != 0 {
+		t.Fatalf("second update failed: %s", result.stderr)
+	}
+
+	currentLink := filepath.Join(root, "share", "demo-tool", "current")
+	metadataPath := filepath.Join(root, "share", "demo-tool", "releases", oldSHA, ".pin", "release.json")
+	setReleaseVerifyToFailWhenActive(t, metadataPath, currentLink, "active rollback boom")
+
+	result := runTool(t, runPin, root, repo, "rollback")
+	requireCode(t, result, 2)
+	requireContains(t, result.stderr, "verify active release")
+	requireContains(t, result.stderr, "active rollback boom")
+	requireReleaseLink(t, root, "current", currentSHA)
+	requireReleaseLink(t, root, "previous", oldSHA)
+	requireInstalledVersion(t, root, "2")
 }
 
 func TestUpdateRefusesDirtySource(t *testing.T) {

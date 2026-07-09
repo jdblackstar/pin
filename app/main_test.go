@@ -234,6 +234,9 @@ func replaceInFile(t *testing.T, path, old, new string) {
 		t.Fatal(err)
 	}
 	updated := strings.Replace(string(data), old, new, 1)
+	if updated == string(data) {
+		t.Fatalf("replacement target not found in %s", path)
+	}
 	if err := os.WriteFile(path, []byte(updated), 0o644); err != nil {
 		t.Fatal(err)
 	}

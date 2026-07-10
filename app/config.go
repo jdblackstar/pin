@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -123,41 +124,44 @@ func resolveContext(toolOrPath string, hasArg bool, opts globalOptions) (pinCont
 }
 
 func resolveToolContext(tool string, opts globalOptions) (pinContext, error) {
-	name, err := validatePathSegment(tool, "tool name")
+	ctx, metadata, err := resolveToolInstall(tool, opts)
+	if err != nil || metadata == nil {
+		return ctx, err
+	}
+	config, err := loadConfigFromMetadata(metadata)
 	if err != nil {
 		return pinContext{}, err
+	}
+	ctx.config = config
+	return ctx, nil
+}
+
+func resolveToolInstall(tool string, opts globalOptions) (pinContext, releaseMetadata, error) {
+	name, err := validatePathSegment(tool, "tool name")
+	if err != nil {
+		return pinContext{}, nil, err
 	}
 	ctx := pinContext{name: name, pinHome: opts.pinHome}
 	metadata, err := readMetadataForTool(opts.pinHome, name)
 	if err != nil {
-		if legacy, ok, legacyErr := legacyContext(name, opts); legacyErr == nil && ok {
-			return legacy, nil
+		if legacy, legacyMetadata, ok, legacyErr := legacyInstall(name, opts); legacyErr == nil && ok {
+			return legacy, legacyMetadata, nil
 		}
-		return pinContext{}, err
+		return pinContext{}, nil, err
 	}
 	if metadata == nil {
-		if legacy, ok, err := legacyContext(name, opts); err != nil || ok {
-			return legacy, err
+		if legacy, legacyMetadata, ok, err := legacyInstall(name, opts); err != nil || ok {
+			return legacy, legacyMetadata, err
 		}
-	} else {
-		config, err := loadConfigFromMetadata(metadata)
-		if err != nil {
-			return pinContext{}, err
-		}
-		ctx.config = config
 	}
-	return ctx, nil
+	if metadata != nil && metadata.string("tool") != name {
+		return pinContext{}, nil, fmt.Errorf("metadata tool %q does not match %q", metadata.string("tool"), name)
+	}
+	return ctx, metadata, nil
 }
 
 func legacyContext(name string, opts globalOptions) (pinContext, bool, error) {
-	if opts.legacyPinHome == "" {
-		return pinContext{}, false, nil
-	}
-	if filepath.Clean(opts.legacyPinHome) == filepath.Clean(opts.pinHome) {
-		return pinContext{}, false, nil
-	}
-	ctx := pinContext{name: name, pinHome: opts.legacyPinHome}
-	metadata, ok, err := legacyMetadata(ctx)
+	ctx, metadata, ok, err := legacyInstall(name, opts)
 	if err != nil || !ok {
 		return pinContext{}, ok, err
 	}
@@ -167,6 +171,96 @@ func legacyContext(name string, opts globalOptions) (pinContext, bool, error) {
 	}
 	ctx.config = config
 	return ctx, true, nil
+}
+
+func legacyInstall(name string, opts globalOptions) (pinContext, releaseMetadata, bool, error) {
+	if opts.legacyPinHome == "" {
+		return pinContext{}, nil, false, nil
+	}
+	if filepath.Clean(opts.legacyPinHome) == filepath.Clean(opts.pinHome) {
+		return pinContext{}, nil, false, nil
+	}
+	ctx := pinContext{name: name, pinHome: opts.legacyPinHome}
+	metadata, ok, err := legacyMetadata(ctx)
+	if err != nil || !ok {
+		return pinContext{}, nil, ok, err
+	}
+	return ctx, metadata, true, nil
+}
+
+func resolveSourceContext(toolOrPath string, hasArg bool, opts globalOptions) (pinContext, error) {
+	var candidate string
+	if !hasArg {
+		wd, err := os.Getwd()
+		if err != nil {
+			return pinContext{}, err
+		}
+		candidate = wd
+	} else {
+		candidate = expandPath(toolOrPath)
+	}
+
+	if !hasArg || pathExists(candidate) {
+		configPath, ok := findConfig(candidate)
+		if !ok {
+			if !hasArg {
+				wd, _ := os.Getwd()
+				return pinContext{}, fmt.Errorf("no %s found from %s", configName, wd)
+			}
+			return pinContext{}, fmt.Errorf("no %s found at %s", configName, candidate)
+		}
+		config, err := loadCommittedConfig(filepath.Dir(configPath))
+		if err != nil {
+			return pinContext{}, err
+		}
+		return sourceContextForConfig(config, opts)
+	}
+
+	if looksLikePath(toolOrPath) {
+		return pinContext{}, fmt.Errorf("path does not exist: %s", candidate)
+	}
+
+	ctx, metadata, err := resolveToolInstall(toolOrPath, opts)
+	if err != nil {
+		return pinContext{}, err
+	}
+	if metadata == nil {
+		return pinContext{}, fmt.Errorf("no installed release for %s; pass a repo path with %s", ctx.name, configName)
+	}
+	sourcePath := metadata.string("source_path")
+	if sourcePath == "" {
+		return pinContext{}, fmt.Errorf("installed metadata for %s does not include source_path", ctx.name)
+	}
+	config, err := loadCommittedConfig(sourcePath)
+	if err != nil {
+		return pinContext{}, err
+	}
+	if config.name != ctx.name {
+		return pinContext{}, fmt.Errorf("source config tool %q does not match installed tool %q", config.name, ctx.name)
+	}
+	ctx.config = config
+	return ctx, nil
+}
+
+func sourceContextForConfig(config *config, opts globalOptions) (pinContext, error) {
+	ctx := pinContext{name: config.name, pinHome: opts.pinHome, config: config}
+	metadata, err := readMetadataForTool(opts.pinHome, ctx.name)
+	if err != nil {
+		if ok, legacyErr := legacyInstallExists(ctx.name, opts); legacyErr == nil && ok {
+			ctx.pinHome = opts.legacyPinHome
+			return ctx, nil
+		}
+		return pinContext{}, err
+	}
+	if metadata == nil {
+		if ok, err := legacyInstallExists(ctx.name, opts); err != nil || ok {
+			if err != nil {
+				return pinContext{}, err
+			}
+			ctx.pinHome = opts.legacyPinHome
+		}
+	}
+	return ctx, nil
 }
 
 func legacyInstallExists(name string, opts globalOptions) (bool, error) {
@@ -243,9 +337,17 @@ func loadConfig(path string) (*config, error) {
 	if err != nil {
 		return nil, err
 	}
+	data, err := os.ReadFile(abs)
+	if err != nil {
+		return nil, err
+	}
+	return decodeConfig(data, filepath.Dir(abs), abs)
+}
+
+func decodeConfig(data []byte, sourcePath, configPath string) (*config, error) {
 	raw := map[string]any{}
-	if _, err := toml.DecodeFile(abs, &raw); err != nil {
-		return nil, fmt.Errorf("invalid %s: %w", abs, err)
+	if _, err := toml.Decode(string(data), &raw); err != nil {
+		return nil, fmt.Errorf("invalid %s: %w", configPath, err)
 	}
 
 	name, err := requirePathSegment(raw, "name")
@@ -256,7 +358,75 @@ func loadConfig(path string) (*config, error) {
 	if err != nil {
 		return nil, err
 	}
-	return buildConfig(raw, name, entrypoint, "", "", filepath.Dir(abs), abs)
+	return buildConfig(raw, name, entrypoint, "", "", sourcePath, configPath)
+}
+
+func loadCommittedConfig(sourcePath string) (*config, error) {
+	configPath, committed, err := committedConfig(sourcePath, "HEAD")
+	if err != nil {
+		return nil, err
+	}
+	working, err := os.ReadFile(configPath)
+	if err != nil {
+		return nil, err
+	}
+	if !bytes.Equal(working, committed) {
+		return nil, fmt.Errorf("source %s has local modifications; commit or restore it before continuing", configName)
+	}
+	return decodeConfig(committed, filepath.Dir(configPath), configPath)
+}
+
+func loadConfigAtRevision(sourcePath, revision string) (*config, error) {
+	configPath, committed, err := committedConfig(sourcePath, revision)
+	if err != nil {
+		return nil, err
+	}
+	return decodeConfig(committed, filepath.Dir(configPath), configPath)
+}
+
+func committedConfig(sourcePath, revision string) (string, []byte, error) {
+	if err := ensureGitRepo(sourcePath); err != nil {
+		return "", nil, err
+	}
+	configPath := filepath.Join(sourcePath, configName)
+	info, err := os.Lstat(configPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil, fmt.Errorf("missing source config: %s", configPath)
+	}
+	if err != nil {
+		return "", nil, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return "", nil, fmt.Errorf("source config must not be a symlink: %s", configPath)
+	}
+	if !info.Mode().IsRegular() {
+		return "", nil, fmt.Errorf("source config is not a regular file: %s", configPath)
+	}
+	topLevel, err := gitOutput(sourcePath, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return "", nil, err
+	}
+	canonicalTopLevel, err := filepath.EvalSymlinks(topLevel)
+	if err != nil {
+		return "", nil, err
+	}
+	canonicalConfigPath, err := filepath.EvalSymlinks(configPath)
+	if err != nil {
+		return "", nil, err
+	}
+	rel, err := filepath.Rel(canonicalTopLevel, canonicalConfigPath)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", nil, fmt.Errorf("source config is outside the Git checkout: %s", configPath)
+	}
+	rel = filepath.ToSlash(rel)
+	if _, err := runGit(sourcePath, "ls-files", "--error-unmatch", "--", rel); err != nil {
+		return "", nil, fmt.Errorf("source config is not tracked by Git: %s", configPath)
+	}
+	result, err := runGit(sourcePath, "show", revision+":"+rel)
+	if err != nil {
+		return "", nil, fmt.Errorf("source config is not committed at %s: %s", revision, configPath)
+	}
+	return configPath, []byte(result.stdout), nil
 }
 
 func loadConfigFromMetadata(metadata releaseMetadata) (*config, error) {

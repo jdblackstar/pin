@@ -72,9 +72,9 @@ func (a app) run(args []string) error {
 	case "verify":
 		return a.commandWithOptionalContext(command, commandArgs, opts, a.commandVerify)
 	case "check":
-		return a.commandWithOptionalContext(command, commandArgs, opts, a.commandCheck)
+		return a.commandWithSourceContext(command, commandArgs, opts, a.commandCheck)
 	case "update":
-		return a.commandWithOptionalContext(command, commandArgs, opts, a.commandUpdate)
+		return a.commandWithSourceContext(command, commandArgs, opts, a.commandUpdate)
 	case "rollback":
 		return a.commandWithOptionalContext(command, commandArgs, opts, a.commandRollback)
 	case "run":
@@ -109,6 +109,18 @@ func (a app) commandWithOptionalContext(command string, args []string, opts glob
 		return err
 	}
 	ctx, err := resolveContext(toolOrPath, hasArg, opts)
+	if err != nil {
+		return err
+	}
+	return run(ctx)
+}
+
+func (a app) commandWithSourceContext(command string, args []string, opts globalOptions, run func(pinContext) error) error {
+	toolOrPath, hasArg, err := optionalSingleArg(command, args)
+	if err != nil {
+		return err
+	}
+	ctx, err := resolveSourceContext(toolOrPath, hasArg, opts)
 	if err != nil {
 		return err
 	}

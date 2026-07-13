@@ -1,7 +1,6 @@
 package app
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -362,71 +361,77 @@ func decodeConfig(data []byte, sourcePath, configPath string) (*config, error) {
 }
 
 func loadCommittedConfig(sourcePath string) (*config, error) {
-	configPath, committed, err := committedConfig(sourcePath, "HEAD")
+	configPath, gitPath, committed, err := committedConfig(sourcePath, "HEAD")
 	if err != nil {
 		return nil, err
 	}
-	working, err := os.ReadFile(configPath)
+	workingSHA, err := gitOutput(sourcePath, "hash-object", "--path="+gitPath, configPath)
 	if err != nil {
 		return nil, err
 	}
-	if !bytes.Equal(working, committed) {
+	committedSHA, err := gitOutput(sourcePath, "rev-parse", "HEAD:"+gitPath)
+	if err != nil {
+		return nil, err
+	}
+	if workingSHA != committedSHA {
 		return nil, fmt.Errorf("source %s has local modifications; commit or restore it before continuing", configName)
 	}
 	return decodeConfig(committed, filepath.Dir(configPath), configPath)
 }
 
 func loadConfigAtRevision(sourcePath, revision string) (*config, error) {
-	configPath, committed, err := committedConfig(sourcePath, revision)
+	configPath, _, committed, err := committedConfig(sourcePath, revision)
 	if err != nil {
 		return nil, err
 	}
 	return decodeConfig(committed, filepath.Dir(configPath), configPath)
 }
 
-func committedConfig(sourcePath, revision string) (string, []byte, error) {
+func committedConfig(sourcePath, revision string) (string, string, []byte, error) {
 	if err := ensureGitRepo(sourcePath); err != nil {
-		return "", nil, err
+		return "", "", nil, err
 	}
 	configPath := filepath.Join(sourcePath, configName)
 	info, err := os.Lstat(configPath)
 	if errors.Is(err, os.ErrNotExist) {
-		return "", nil, fmt.Errorf("missing source config: %s", configPath)
+		return "", "", nil, fmt.Errorf("missing source config: %s", configPath)
 	}
 	if err != nil {
-		return "", nil, err
+		return "", "", nil, err
 	}
 	if info.Mode()&os.ModeSymlink != 0 {
-		return "", nil, fmt.Errorf("source config must not be a symlink: %s", configPath)
+		return "", "", nil, fmt.Errorf("source config must not be a symlink: %s", configPath)
 	}
 	if !info.Mode().IsRegular() {
-		return "", nil, fmt.Errorf("source config is not a regular file: %s", configPath)
+		return "", "", nil, fmt.Errorf("source config is not a regular file: %s", configPath)
 	}
 	topLevel, err := gitOutput(sourcePath, "rev-parse", "--show-toplevel")
 	if err != nil {
-		return "", nil, err
+		return "", "", nil, err
 	}
 	canonicalTopLevel, err := filepath.EvalSymlinks(topLevel)
 	if err != nil {
-		return "", nil, err
+		return "", "", nil, err
 	}
 	canonicalConfigPath, err := filepath.EvalSymlinks(configPath)
 	if err != nil {
-		return "", nil, err
+		return "", "", nil, err
 	}
 	rel, err := filepath.Rel(canonicalTopLevel, canonicalConfigPath)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return "", nil, fmt.Errorf("source config is outside the Git checkout: %s", configPath)
+		return "", "", nil, fmt.Errorf("source config is outside the Git checkout: %s", configPath)
 	}
 	rel = filepath.ToSlash(rel)
 	if _, err := runGit(sourcePath, "ls-files", "--error-unmatch", "--", rel); err != nil {
-		return "", nil, fmt.Errorf("source config is not tracked by Git: %s", configPath)
+		return "", "", nil, fmt.Errorf("source config is not tracked by Git: %s", configPath)
 	}
 	result, err := runGit(sourcePath, "show", revision+":"+rel)
 	if err != nil {
-		return "", nil, fmt.Errorf("source config is not committed at %s: %s", revision, configPath)
+		return "", "", nil, fmt.Errorf("source config is not committed at %s: %s", revision, configPath)
 	}
-	return configPath, []byte(result.stdout), nil
+	// Keep the caller-facing checkout path; canonical paths are only needed for
+	// containment and Git object lookup.
+	return configPath, rel, []byte(result.stdout), nil
 }
 
 func loadConfigFromMetadata(metadata releaseMetadata) (*config, error) {

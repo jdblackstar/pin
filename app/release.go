@@ -241,6 +241,8 @@ func updateRelease(ctx pinContext) (updateReport, error) {
 	if selectedConfig.name != ctx.name {
 		return updateReport{}, fmt.Errorf("source config tool %q does not match installed tool %q", selectedConfig.name, ctx.name)
 	}
+	// Close the race where HEAD changes after source config resolution but before
+	// the selected SHA is reloaded.
 	if !sameConfig(*config, *selectedConfig) {
 		return updateReport{}, fmt.Errorf("source %s changed while selecting release %s; retry the update", configName, sha)
 	}

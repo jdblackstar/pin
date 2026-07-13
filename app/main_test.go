@@ -1660,6 +1660,56 @@ func TestSourceConfigMustBeCommittedRegularFile(t *testing.T) {
 	})
 }
 
+func TestSourceConfigAllowsGitLineEndingConversion(t *testing.T) {
+	root := t.TempDir()
+	repo, _ := sourceRepo(t, root)
+	writeFile(t, filepath.Join(repo, ".gitattributes"), "pin.toml text eol=crlf\n")
+	git(t, repo, "add", ".gitattributes")
+	git(t, repo, "add", "--renormalize", "pin.toml")
+	git(t, repo, "commit", "-m", "configure pin config line endings")
+	git(t, repo, "push")
+
+	configPath := filepath.Join(repo, "pin.toml")
+	config := strings.ReplaceAll(mustReadFile(t, configPath), "\r\n", "\n")
+	writeFile(t, configPath, strings.ReplaceAll(config, "\n", "\r\n"))
+	if !strings.Contains(mustReadFile(t, configPath), "\r\n") {
+		t.Fatal("working pin.toml was not converted to CRLF")
+	}
+	if diff := git(t, repo, "diff", "--", "pin.toml"); diff != "" {
+		t.Fatalf("Git considers converted pin.toml content modified:\n%s", diff)
+	}
+
+	result := runTool(t, runPin, root, repo, "check")
+	requireCode(t, result, 1)
+	requireContains(t, result.stdout, "status: not-installed")
+	if result.stderr != "" {
+		t.Fatalf("check stderr = %q, want empty", result.stderr)
+	}
+}
+
+func TestSourceConfigPreservesSymlinkedCheckoutPath(t *testing.T) {
+	root := t.TempDir()
+	repo, sha := sourceRepo(t, root)
+	linkedRepo := filepath.Join(root, "linked-repo")
+	if err := os.Symlink(repo, linkedRepo); err != nil {
+		t.Fatal(err)
+	}
+
+	result := runTool(t, runPin, root, linkedRepo, "update")
+	requireCode(t, result, 0)
+	metadata, err := readReleaseMetadata(filepath.Join(root, "share", "demo-tool", "releases", sha))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := metadata.string("source_path"); got != linkedRepo {
+		t.Fatalf("source_path = %q, want caller-facing path %q", got, linkedRepo)
+	}
+
+	result = runPin(t, root, "check", "demo-tool")
+	requireCode(t, result, 0)
+	requireContains(t, result.stdout, "status: current")
+}
+
 func TestLegacyToolNameUpdateUsesSourceConfig(t *testing.T) {
 	root := t.TempDir()
 	repo, _ := sourceRepo(t, root)

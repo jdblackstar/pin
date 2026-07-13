@@ -1734,6 +1734,48 @@ func TestLegacyToolNameUpdateUsesSourceConfig(t *testing.T) {
 	}
 }
 
+func TestUpdateRebuildsReleaseMissingMetadata(t *testing.T) {
+	root := t.TempDir()
+	repo, sha := sourceRepo(t, root)
+	release := filepath.Join(root, "share", "demo-tool", "releases", sha)
+	writeFile(t, filepath.Join(release, "interrupted-build"), "incomplete\n")
+
+	result := runTool(t, runPin, root, repo, "update")
+	requireCode(t, result, 0)
+	requireInstalledVersion(t, root, "1")
+	requireReleaseMetadata(t, root, sha)
+	if _, err := os.Stat(filepath.Join(release, "interrupted-build")); !os.IsNotExist(err) {
+		t.Fatalf("incomplete release contents survived rebuild: %v", err)
+	}
+}
+
+func TestEnsureReleaseDoesNotRebuildActiveReleaseMissingMetadata(t *testing.T) {
+	root := t.TempDir()
+	repo, sha := sourceRepo(t, root)
+	config, err := loadCommittedConfig(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := pinContext{name: config.name, pinHome: filepath.Join(root, "share"), config: config}
+	release := releasePath(ctx, sha)
+	marker := filepath.Join(release, "active-runtime")
+	writeFile(t, marker, "keep\n")
+	if err := os.Symlink(filepath.Join("releases", sha), ctx.currentLink()); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := ensureRelease(ctx, *config, sha); err == nil {
+		t.Fatal("expected active incomplete release rebuild to fail")
+	} else {
+		requireContains(t, err.Error(), "is active but missing metadata")
+		requireContains(t, err.Error(), "it was left unchanged")
+	}
+	if got := mustReadFile(t, marker); got != "keep\n" {
+		t.Fatalf("active release marker = %q, want unchanged", got)
+	}
+	requireReleaseLink(t, root, "current", sha)
+}
+
 func TestFirstUpdateRestoresLinksWhenActiveVerificationFails(t *testing.T) {
 	root := t.TempDir()
 	repo, _ := sourceRepo(t, root)

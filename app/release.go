@@ -8,9 +8,11 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -291,8 +293,19 @@ func rollbackRelease(ctx pinContext) (rollbackReport, error) {
 func ensureRelease(ctx pinContext, config config, sha string) (string, error) {
 	release := releasePath(ctx, sha)
 	exists, err := directoryExists(release)
-	if err != nil || exists {
+	if err != nil {
 		return release, err
+	}
+	if exists {
+		metadataPath := filepath.Join(release, metadataDir, metadataName)
+		if _, err := os.Stat(metadataPath); err == nil {
+			return release, nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return release, err
+		}
+		if err := os.RemoveAll(release); err != nil {
+			return release, fmt.Errorf("remove incomplete release %s: %w", release, err)
+		}
 	}
 	return buildRelease(ctx, config, sha)
 }
@@ -968,20 +981,63 @@ func activateAndVerifyRelease(ctx pinContext, sha, activationStep string) error 
 	if err != nil {
 		return fmt.Errorf("capture release links: %w", err)
 	}
+	var restoreOnce sync.Once
+	var restoreErr error
+	restore := func() error {
+		restoreOnce.Do(func() {
+			restoreErr = links.restore()
+		})
+		return restoreErr
+	}
 
-	err = runSteps(
-		releaseStep{activationStep, func() error { return activateRelease(ctx, sha) }},
-		releaseStep{"verify active release", func() error {
-			_, err := verifyActive(ctx)
-			return err
-		}},
-	)
+	err = runWithSignalRestoration(restore, func() error {
+		return runSteps(
+			releaseStep{activationStep, func() error { return activateRelease(ctx, sha) }},
+			releaseStep{"verify active release", func() error {
+				_, err := verifyActive(ctx)
+				return err
+			}},
+		)
+	})
 	if err == nil {
 		return nil
 	}
-	if restoreErr := links.restore(); restoreErr != nil {
+	if restoreErr := restore(); restoreErr != nil {
 		return errors.Join(err, fmt.Errorf("restore release links: %w", restoreErr))
 	}
+	return err
+}
+
+func runWithSignalRestoration(restore func() error, run func() error) error {
+	signals := make(chan os.Signal, 1)
+	done := make(chan struct{})
+	handlerDone := make(chan struct{})
+	signal.Notify(signals, activationSignals()...)
+
+	handleSignal := func(received os.Signal) {
+		_ = restore()
+		os.Exit(exitCodeForSignal(received))
+	}
+	go func() {
+		defer close(handlerDone)
+		select {
+		case received := <-signals:
+			handleSignal(received)
+		case <-done:
+			// Prefer a signal already queued before signal.Stop completed over
+			// normal shutdown of the handler.
+			select {
+			case received := <-signals:
+				handleSignal(received)
+			default:
+			}
+		}
+	}()
+
+	err := run()
+	signal.Stop(signals)
+	close(done)
+	<-handlerDone
 	return err
 }
 

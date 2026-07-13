@@ -1406,6 +1406,21 @@ func TestE2ECompiledBinaryVerifyFailureDoesNotActivateRelease(t *testing.T) {
 	}
 }
 
+func TestUpdateRebuildsReleaseMissingMetadata(t *testing.T) {
+	root := t.TempDir()
+	repo, sha := sourceRepo(t, root)
+	release := filepath.Join(root, "share", "demo-tool", "releases", sha)
+	writeFile(t, filepath.Join(release, "interrupted-build"), "incomplete\n")
+
+	result := runTool(t, runPin, root, repo, "update")
+	requireCode(t, result, 0)
+	requireInstalledVersion(t, root, "1")
+	requireReleaseMetadata(t, root, sha)
+	if _, err := os.Stat(filepath.Join(release, "interrupted-build")); !os.IsNotExist(err) {
+		t.Fatalf("incomplete release contents survived rebuild: %v", err)
+	}
+}
+
 func TestFirstUpdateRestoresLinksWhenActiveVerificationFails(t *testing.T) {
 	root := t.TempDir()
 	repo, _ := sourceRepo(t, root)

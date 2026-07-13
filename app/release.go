@@ -236,7 +236,22 @@ func updateRelease(ctx pinContext) (updateReport, error) {
 	if err != nil {
 		return updateReport{}, err
 	}
-	release, err := ensureRelease(ctx, *config, sha)
+	selectedConfig, err := loadConfigAtRevision(config.sourcePath, sha)
+	if err != nil {
+		return updateReport{}, err
+	}
+	if selectedConfig.name != ctx.name {
+		return updateReport{}, fmt.Errorf("source config tool %q does not match installed tool %q", selectedConfig.name, ctx.name)
+	}
+	// Close the race where HEAD changes after source config resolution but before
+	// the selected SHA is reloaded.
+	if !sameConfig(*config, *selectedConfig) {
+		return updateReport{}, fmt.Errorf("source %s changed while selecting release %s; retry the update", configName, sha)
+	}
+	if err := runConfiguredCommands(selectedConfig.preflight, selectedConfig.sourcePath, nil); err != nil {
+		return updateReport{}, err
+	}
+	release, err := ensureRelease(ctx, *selectedConfig, sha)
 	if err != nil {
 		return updateReport{}, err
 	}
@@ -298,16 +313,63 @@ func ensureRelease(ctx pinContext, config config, sha string) (string, error) {
 	}
 	if exists {
 		metadataPath := filepath.Join(release, metadataDir, metadataName)
-		if _, err := os.Stat(metadataPath); err == nil {
-			return release, nil
-		} else if !errors.Is(err, os.ErrNotExist) {
+		if _, err := os.Stat(metadataPath); errors.Is(err, os.ErrNotExist) {
+			active, activeErr := releaseIsActive(ctx, release)
+			if activeErr != nil {
+				return "", activeErr
+			}
+			if active {
+				return "", fmt.Errorf("release %s is active but missing metadata; it was left unchanged; commit a new source revision and retry", sha)
+			}
+			if err := os.RemoveAll(release); err != nil {
+				return release, fmt.Errorf("remove incomplete release %s: %w", release, err)
+			}
+			return buildRelease(ctx, config, sha)
+		} else if err != nil {
 			return release, err
 		}
-		if err := os.RemoveAll(release); err != nil {
-			return release, fmt.Errorf("remove incomplete release %s: %w", release, err)
+
+		metadata, err := readReleaseMetadata(release)
+		if err != nil {
+			return "", fmt.Errorf("existing release %s cannot be safely reused: %w", release, err)
 		}
+		storedConfig, err := loadConfigFromMetadata(metadata)
+		if err != nil {
+			return "", fmt.Errorf("existing release %s cannot be safely reused: %w", release, err)
+		}
+		if err := validateMetadata(ctx, release, metadata, *storedConfig); err != nil {
+			return "", fmt.Errorf("existing release %s cannot be safely reused: %w", release, err)
+		}
+		if !sameConfig(config, *storedConfig) {
+			active, err := releaseIsActive(ctx, release)
+			if err != nil {
+				return "", err
+			}
+			if active {
+				return "", fmt.Errorf("release %s is active and was built with different config than committed %s; it was left unchanged; commit a new source revision and retry", sha, configName)
+			}
+			return "", fmt.Errorf("inactive release %s was built with different config than committed %s; it was left unchanged; move or remove %s and retry", sha, configName, release)
+		}
+		return release, nil
 	}
 	return buildRelease(ctx, config, sha)
+}
+
+func releaseIsActive(ctx pinContext, release string) (bool, error) {
+	active, ok, err := releaseSymlink(ctx, ctx.currentLink())
+	if err != nil || !ok {
+		return false, err
+	}
+	return filepath.Clean(active) == filepath.Clean(release), nil
+}
+
+func sameConfig(left, right config) bool {
+	if left.name != right.name || left.entrypoint != right.entrypoint || left.branch != right.branch || left.remote != right.remote {
+		return false
+	}
+	leftRaw, leftErr := json.Marshal(left.raw)
+	rightRaw, rightErr := json.Marshal(right.raw)
+	return leftErr == nil && rightErr == nil && bytes.Equal(leftRaw, rightRaw)
 }
 
 func sourceSHAForUpdate(config config) (string, error) {
@@ -338,9 +400,6 @@ func sourceSHAForUpdate(config config) (string, error) {
 	}
 	if head != target {
 		return "", fmt.Errorf("HEAD %s does not match %s %s", head, branchRef(config), target)
-	}
-	if err := runConfiguredCommands(config.preflight, config.sourcePath, nil); err != nil {
-		return "", err
 	}
 	return head, nil
 }

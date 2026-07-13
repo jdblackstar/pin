@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -252,6 +253,12 @@ func commitToolVersion(t *testing.T, repo, version string, amend bool) string {
 	}
 	git(t, repo, args...)
 	return git(t, repo, "rev-parse", "HEAD")
+}
+
+func commitPinConfig(t *testing.T, repo, message string) {
+	t.Helper()
+	git(t, repo, "add", "pin.toml")
+	git(t, repo, "commit", "-m", message)
 }
 
 func forceRemoteMain(t *testing.T, repo, sha string) {
@@ -1406,6 +1413,327 @@ func TestE2ECompiledBinaryVerifyFailureDoesNotActivateRelease(t *testing.T) {
 	}
 }
 
+func TestE2ECompiledBinaryToolNameUpdateUsesCommittedSourceVerification(t *testing.T) {
+	root := t.TempDir()
+	repo, oldSHA := sourceRepo(t, root)
+
+	result := runTool(t, runCompiledPin, root, repo, "update")
+	requireCode(t, result, 0)
+	requireReleaseLink(t, root, "current", oldSHA)
+
+	writeTool(t, repo, "2")
+	marker := filepath.Join(root, "b-verifier-ran")
+	script, _ := json.Marshal("from pathlib import Path; Path(" + strconv.Quote(marker) + ").write_text('ran'); raise SystemExit(9)")
+	replaceInFile(
+		t,
+		filepath.Join(repo, "pin.toml"),
+		`verify = ["demo-tool"]`,
+		`verify = [["python3", "-c", `+string(script)+`]]`,
+	)
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-m", "release B verifier")
+	newSHA := git(t, repo, "rev-parse", "HEAD")
+	git(t, repo, "push")
+
+	result = runCompiledPin(t, root, "update", "demo-tool")
+	requireCode(t, result, 2)
+	requireContains(t, result.stderr, "verify release")
+	if got := strings.TrimSpace(mustReadFile(t, marker)); got != "ran" {
+		t.Fatalf("B verifier marker = %q, want ran", got)
+	}
+	requireReleaseLink(t, root, "current", oldSHA)
+	requireInstalledVersion(t, root, "1")
+	if _, err := os.Stat(filepath.Join(root, "share", "demo-tool", "releases", newSHA)); err != nil {
+		t.Fatalf("failed B candidate should remain inspectable: %v", err)
+	}
+}
+
+func TestToolNameUpdateStoresCommittedSourceConfig(t *testing.T) {
+	root := t.TempDir()
+	repo, _ := sourceRepo(t, root)
+	if result := runTool(t, runPin, root, repo, "update"); result.code != 0 {
+		t.Fatalf("install A failed: %s", result.stderr)
+	}
+
+	writeTool(t, repo, "2")
+	replaceInFile(t, filepath.Join(repo, "pin.toml"), `verify = ["demo-tool"]`, `verify = [["demo-tool", "--help"]]`)
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-m", "release B config")
+	newSHA := git(t, repo, "rev-parse", "HEAD")
+	git(t, repo, "push")
+
+	result := runPin(t, root, "update", "demo-tool")
+	requireCode(t, result, 0)
+	requireReleaseLink(t, root, "current", newSHA)
+	metadata, err := readReleaseMetadata(filepath.Join(root, "share", "demo-tool", "releases", newSHA))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, ok := metadata["config"].(map[string]any)
+	if !ok {
+		t.Fatalf("metadata config is invalid: %#v", metadata["config"])
+	}
+	verify, ok := raw["verify"].([]any)
+	if !ok || len(verify) != 1 {
+		t.Fatalf("metadata verify = %#v, want B config", raw["verify"])
+	}
+	command, ok := verify[0].([]any)
+	if !ok || len(command) != 2 || command[0] != "demo-tool" || command[1] != "--help" {
+		t.Fatalf("metadata verify = %#v, want [[demo-tool --help]]", raw["verify"])
+	}
+}
+
+func TestCheckToolNameReloadsCommittedSourceConfig(t *testing.T) {
+	root := t.TempDir()
+	repo, oldSHA := sourceRepo(t, root)
+	if result := runTool(t, runPin, root, repo, "update"); result.code != 0 {
+		t.Fatalf("install A failed: %s", result.stderr)
+	}
+
+	remote := git(t, repo, "remote", "get-url", "origin")
+	git(t, repo, "remote", "add", "upstream", remote)
+	writeTool(t, repo, "2")
+	replaceInFile(t, filepath.Join(repo, "pin.toml"), `remote = "origin"`, `remote = "upstream"`)
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-m", "change source authority")
+	newSHA := git(t, repo, "rev-parse", "HEAD")
+	git(t, repo, "push", "origin", "main")
+
+	result := runPin(t, root, "check", "demo-tool")
+	requireCode(t, result, 1)
+	requireContains(t, result.stdout, "active: "+oldSHA)
+	requireContains(t, result.stdout, "target: "+newSHA)
+	requireContains(t, result.stdout, "branch: upstream/main")
+}
+
+func TestRuntimeCommandsKeepUsingReleaseMetadata(t *testing.T) {
+	root := t.TempDir()
+	repo, oldSHA := sourceRepo(t, root)
+	if result := runTool(t, runPin, root, repo, "update"); result.code != 0 {
+		t.Fatalf("install A failed: %s", result.stderr)
+	}
+	newSHA := commitToolVersion(t, repo, "2", false)
+	git(t, repo, "push")
+	if result := runPin(t, root, "update", "demo-tool"); result.code != 0 {
+		t.Fatalf("install B failed: %s", result.stderr)
+	}
+
+	writeFile(t, filepath.Join(repo, "pin.toml"), `name = "different-tool"
+source = "."
+inject = ["bogus"]
+verify = [["python3", "-c", "raise SystemExit(9)"]]
+`)
+
+	result := runPin(t, root, "status", "demo-tool")
+	requireCode(t, result, 0)
+	if strings.Contains(result.stdout, "bogus") {
+		t.Fatalf("tool-name status used mutable source config:\n%s", result.stdout)
+	}
+	result = runPin(t, root, "run", "demo-tool")
+	requireCode(t, result, 0)
+	if strings.TrimSpace(result.stdout) != "demo 2" {
+		t.Fatalf("run stdout = %q, want demo 2", result.stdout)
+	}
+	result = runPin(t, root, "verify", "demo-tool")
+	requireCode(t, result, 0)
+	requireContains(t, result.stdout, "verified: demo-tool "+newSHA)
+	result = runPin(t, root, "rollback", "demo-tool")
+	requireCode(t, result, 0)
+	requireContains(t, result.stdout, "rolled back: demo-tool "+oldSHA)
+	requireInstalledVersion(t, root, "1")
+}
+
+func TestSourceCommandsReportMissingAndMismatchedConfig(t *testing.T) {
+	t.Run("missing", func(t *testing.T) {
+		root := t.TempDir()
+		repo, _ := sourceRepo(t, root)
+		if result := runTool(t, runPin, root, repo, "update"); result.code != 0 {
+			t.Fatalf("install failed: %s", result.stderr)
+		}
+		if err := os.Remove(filepath.Join(repo, "pin.toml")); err != nil {
+			t.Fatal(err)
+		}
+		result := runPin(t, root, "check", "demo-tool")
+		requireCode(t, result, 2)
+		requireContains(t, result.stderr, "missing source config")
+	})
+
+	t.Run("mismatched tool", func(t *testing.T) {
+		root := t.TempDir()
+		repo, _ := sourceRepo(t, root)
+		if result := runTool(t, runPin, root, repo, "update"); result.code != 0 {
+			t.Fatalf("install failed: %s", result.stderr)
+		}
+		replaceInFile(t, filepath.Join(repo, "pin.toml"), `name = "demo-tool"`, `name = "other-tool"`)
+		git(t, repo, "add", "pin.toml")
+		git(t, repo, "commit", "-m", "rename tool in source config")
+		git(t, repo, "push")
+		result := runPin(t, root, "check", "demo-tool")
+		requireCode(t, result, 2)
+		requireContains(t, result.stderr, `source config tool "other-tool" does not match installed tool "demo-tool"`)
+	})
+}
+
+func TestUpdateRefusesSameSHAReleaseWithConflictingConfig(t *testing.T) {
+	root := t.TempDir()
+	repo, sha := sourceRepo(t, root)
+	if result := runTool(t, runPin, root, repo, "update"); result.code != 0 {
+		t.Fatalf("install failed: %s", result.stderr)
+	}
+	if result := runPin(t, root, "update", "demo-tool"); result.code != 0 {
+		t.Fatalf("matching same-SHA release was not reused: %s", result.stderr)
+	}
+	metadataPath := filepath.Join(root, "share", "demo-tool", "releases", sha, ".pin", "release.json")
+	var metadata map[string]any
+	if err := json.Unmarshal([]byte(mustReadFile(t, metadataPath)), &metadata); err != nil {
+		t.Fatal(err)
+	}
+	raw := metadata["config"].(map[string]any)
+	raw["verify"] = []any{"stale-verifier"}
+	data, err := json.MarshalIndent(metadata, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, metadataPath, string(data)+"\n")
+	before := mustReadFile(t, metadataPath)
+
+	result := runPin(t, root, "update", "demo-tool")
+	requireCode(t, result, 2)
+	requireContains(t, result.stderr, "release "+sha+" is active")
+	requireContains(t, result.stderr, "different config than committed pin.toml")
+	requireContains(t, result.stderr, "it was left unchanged")
+	requireContains(t, result.stderr, "commit a new source revision and retry")
+	requireReleaseLink(t, root, "current", sha)
+	if after := mustReadFile(t, metadataPath); after != before {
+		t.Fatal("active same-SHA release metadata was mutated")
+	}
+
+	if err := os.Remove(filepath.Join(root, "share", "demo-tool", "current")); err != nil {
+		t.Fatal(err)
+	}
+	result = runTool(t, runPin, root, repo, "update")
+	requireCode(t, result, 2)
+	requireContains(t, result.stderr, "inactive release "+sha)
+	requireContains(t, result.stderr, "it was left unchanged")
+	requireContains(t, result.stderr, "move or remove "+filepath.Dir(filepath.Dir(metadataPath))+" and retry")
+}
+
+func TestSourceConfigMustBeCommittedRegularFile(t *testing.T) {
+	t.Run("locally modified", func(t *testing.T) {
+		root := t.TempDir()
+		repo, _ := sourceRepo(t, root)
+		appendFile(t, filepath.Join(repo, "pin.toml"), "# local\n")
+		result := runTool(t, runPin, root, repo, "update")
+		requireCode(t, result, 2)
+		requireContains(t, result.stderr, "source pin.toml has local modifications")
+	})
+
+	t.Run("untracked and ignored", func(t *testing.T) {
+		root := t.TempDir()
+		repo, _ := sourceRepo(t, root)
+		original := mustReadFile(t, filepath.Join(repo, "pin.toml"))
+		git(t, repo, "rm", "pin.toml")
+		writeFile(t, filepath.Join(repo, ".gitignore"), "pin.toml\n")
+		git(t, repo, "add", ".gitignore")
+		git(t, repo, "commit", "-m", "ignore local config")
+		git(t, repo, "push")
+		writeFile(t, filepath.Join(repo, "pin.toml"), original)
+		result := runTool(t, runPin, root, repo, "update")
+		requireCode(t, result, 2)
+		requireContains(t, result.stderr, "source config is not tracked by Git")
+	})
+
+	t.Run("symlink", func(t *testing.T) {
+		root := t.TempDir()
+		repo, _ := sourceRepo(t, root)
+		configPath := filepath.Join(repo, "pin.toml")
+		writeFile(t, filepath.Join(repo, "linked-pin.toml"), mustReadFile(t, configPath))
+		if err := os.Remove(configPath); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink("linked-pin.toml", configPath); err != nil {
+			t.Fatal(err)
+		}
+		result := runTool(t, runPin, root, repo, "update")
+		requireCode(t, result, 2)
+		requireContains(t, result.stderr, "source config must not be a symlink")
+	})
+}
+
+func TestSourceConfigAllowsGitLineEndingConversion(t *testing.T) {
+	root := t.TempDir()
+	repo, _ := sourceRepo(t, root)
+	writeFile(t, filepath.Join(repo, ".gitattributes"), "pin.toml text eol=crlf\n")
+	git(t, repo, "add", ".gitattributes")
+	git(t, repo, "add", "--renormalize", "pin.toml")
+	git(t, repo, "commit", "-m", "configure pin config line endings")
+	git(t, repo, "push")
+
+	configPath := filepath.Join(repo, "pin.toml")
+	config := strings.ReplaceAll(mustReadFile(t, configPath), "\r\n", "\n")
+	writeFile(t, configPath, strings.ReplaceAll(config, "\n", "\r\n"))
+	if !strings.Contains(mustReadFile(t, configPath), "\r\n") {
+		t.Fatal("working pin.toml was not converted to CRLF")
+	}
+	if diff := git(t, repo, "diff", "--", "pin.toml"); diff != "" {
+		t.Fatalf("Git considers converted pin.toml content modified:\n%s", diff)
+	}
+
+	result := runTool(t, runPin, root, repo, "check")
+	requireCode(t, result, 1)
+	requireContains(t, result.stdout, "status: not-installed")
+	if result.stderr != "" {
+		t.Fatalf("check stderr = %q, want empty", result.stderr)
+	}
+}
+
+func TestSourceConfigPreservesSymlinkedCheckoutPath(t *testing.T) {
+	root := t.TempDir()
+	repo, sha := sourceRepo(t, root)
+	linkedRepo := filepath.Join(root, "linked-repo")
+	if err := os.Symlink(repo, linkedRepo); err != nil {
+		t.Fatal(err)
+	}
+
+	result := runTool(t, runPin, root, linkedRepo, "update")
+	requireCode(t, result, 0)
+	metadata, err := readReleaseMetadata(filepath.Join(root, "share", "demo-tool", "releases", sha))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := metadata.string("source_path"); got != linkedRepo {
+		t.Fatalf("source_path = %q, want caller-facing path %q", got, linkedRepo)
+	}
+
+	result = runPin(t, root, "check", "demo-tool")
+	requireCode(t, result, 0)
+	requireContains(t, result.stdout, "status: current")
+}
+
+func TestLegacyToolNameUpdateUsesSourceConfig(t *testing.T) {
+	root := t.TempDir()
+	repo, _ := sourceRepo(t, root)
+	legacyPinHome := filepath.Join(root, ".local", "share")
+	if result := runPinWithPinHome(t, root, legacyPinHome, "update", repo); result.code != 0 {
+		t.Fatalf("legacy install failed: %s", result.stderr)
+	}
+	newSHA := commitToolVersion(t, repo, "2", false)
+	git(t, repo, "push")
+
+	result := runPinWithHome(t, root, "update", "demo-tool")
+	requireCode(t, result, 0)
+	target, err := filepath.EvalSymlinks(filepath.Join(legacyHomeToolRoot(root), "current"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Base(target) != newSHA {
+		t.Fatalf("legacy current = %s, want %s", filepath.Base(target), newSHA)
+	}
+	if _, err := os.Stat(filepath.Join(defaultHomeToolRoot(root), "releases", newSHA)); !os.IsNotExist(err) {
+		t.Fatal("tool-name update unexpectedly created a namespaced release")
+	}
+}
+
 func TestUpdateRebuildsReleaseMissingMetadata(t *testing.T) {
 	root := t.TempDir()
 	repo, sha := sourceRepo(t, root)
@@ -1419,6 +1747,33 @@ func TestUpdateRebuildsReleaseMissingMetadata(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(release, "interrupted-build")); !os.IsNotExist(err) {
 		t.Fatalf("incomplete release contents survived rebuild: %v", err)
 	}
+}
+
+func TestEnsureReleaseDoesNotRebuildActiveReleaseMissingMetadata(t *testing.T) {
+	root := t.TempDir()
+	repo, sha := sourceRepo(t, root)
+	config, err := loadCommittedConfig(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := pinContext{name: config.name, pinHome: filepath.Join(root, "share"), config: config}
+	release := releasePath(ctx, sha)
+	marker := filepath.Join(release, "active-runtime")
+	writeFile(t, marker, "keep\n")
+	if err := os.Symlink(filepath.Join("releases", sha), ctx.currentLink()); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := ensureRelease(ctx, *config, sha); err == nil {
+		t.Fatal("expected active incomplete release rebuild to fail")
+	} else {
+		requireContains(t, err.Error(), "is active but missing metadata")
+		requireContains(t, err.Error(), "it was left unchanged")
+	}
+	if got := mustReadFile(t, marker); got != "keep\n" {
+		t.Fatalf("active release marker = %q, want unchanged", got)
+	}
+	requireReleaseLink(t, root, "current", sha)
 }
 
 func TestFirstUpdateRestoresLinksWhenActiveVerificationFails(t *testing.T) {
@@ -1553,6 +1908,7 @@ func TestConfigRejectsPathEscapingValues(t *testing.T) {
 				}
 				replacePinValue(t, repo, tc.key, oldValue, tc.badValue)
 			}
+			commitPinConfig(t, repo, "commit invalid config")
 
 			result := runTool(t, runPin, root, repo, "update")
 			if result.code != 2 {
@@ -1579,6 +1935,7 @@ func TestConfigRejectsOverlappingInjectedPaths(t *testing.T) {
 	root := t.TempDir()
 	repo, _ := sourceRepo(t, root)
 	appendFile(t, filepath.Join(repo, "pin.toml"), "inject = [\"tokens\", \"tokens/gmail_token.json\"]\n")
+	commitPinConfig(t, repo, "commit overlapping inject config")
 
 	result := runTool(t, runPin, root, repo, "update")
 	requireCode(t, result, 2)
@@ -1589,6 +1946,7 @@ func TestConfigRejectsRequirementsForPackageSource(t *testing.T) {
 	root := t.TempDir()
 	repo, _ := sourceRepo(t, root)
 	appendFile(t, filepath.Join(repo, "pin.toml"), `requirements = "requirements.txt"`+"\n")
+	commitPinConfig(t, repo, "commit invalid requirements config")
 
 	result := runTool(t, runPin, root, repo, "update")
 	requireCode(t, result, 2)
@@ -1599,6 +1957,7 @@ func TestConfigRejectsMissingSource(t *testing.T) {
 	root := t.TempDir()
 	repo, _ := sourceRepo(t, root)
 	replaceInFile(t, filepath.Join(repo, "pin.toml"), "source = \".\"\n", "")
+	commitPinConfig(t, repo, "commit missing source config")
 
 	result := runTool(t, runPin, root, repo, "update")
 	requireCode(t, result, 2)
@@ -1610,6 +1969,7 @@ func TestConfigRejectsDeprecatedScriptKey(t *testing.T) {
 	repo, _ := sourceRepo(t, root)
 	replacePinValue(t, repo, "source", ".", "automation/demo_tool.py")
 	replaceInFile(t, filepath.Join(repo, "pin.toml"), `source = "automation/demo_tool.py"`, `script = "automation/demo_tool.py"`)
+	commitPinConfig(t, repo, "commit deprecated script config")
 
 	result := runTool(t, runPin, root, repo, "update")
 	requireCode(t, result, 2)

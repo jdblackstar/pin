@@ -462,6 +462,9 @@ func TestVerifyCheckAndUpdateAll(t *testing.T) {
 		result := runPin(t, root, "update", repo)
 		requireCode(t, result, 0)
 	}
+	if err := os.MkdirAll(filepath.Join(root, "share", "orphaned"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 
 	result := runPin(t, root, "verify", "--all")
 	requireCode(t, result, 0)
@@ -493,6 +496,27 @@ func TestVerifyCheckAndUpdateAll(t *testing.T) {
 	requireContains(t, result.stdout, "updated: alpha "+alphaNewSHA)
 	requireContains(t, result.stdout, "summary: 1 updated, 0 failed")
 	requireReleaseLinkForTool(t, root, "alpha", "current", alphaNewSHA)
+}
+
+func TestUpdateAllCancellationSummarizesPrecheckFailures(t *testing.T) {
+	root := t.TempDir()
+	alphaRepo, _ := namedSourceRepo(t, filepath.Join(root, "alpha-source"), "alpha")
+	betaRepo, _ := namedSourceRepo(t, filepath.Join(root, "beta-source"), "beta")
+	for _, repo := range []string{alphaRepo, betaRepo} {
+		result := runPin(t, root, "update", repo)
+		requireCode(t, result, 0)
+	}
+
+	commitNamedToolVersion(t, alphaRepo, "alpha", "2")
+	if err := os.Rename(betaRepo, betaRepo+"-missing"); err != nil {
+		t.Fatal(err)
+	}
+
+	result := runPinWithInput(t, root, "n\n", "update", "--all")
+	requireCode(t, result, 1)
+	requireContains(t, result.stderr, "failed: beta:")
+	requireContains(t, result.stdout, "update cancelled")
+	requireContains(t, result.stdout, "summary: 0 updated, 1 failed")
 }
 
 func TestVerifyAllContinuesAfterFailure(t *testing.T) {

@@ -98,7 +98,11 @@ func installedToolNames(opts globalOptions) ([]string, error) {
 		return nil, err
 	}
 	for _, entry := range entries {
-		if entry.IsDir() {
+		if !entry.IsDir() {
+			continue
+		}
+		metadata, err := readMetadataForTool(opts.pinHome, entry.Name())
+		if err == nil && metadata != nil {
 			names[entry.Name()] = true
 		}
 	}
@@ -231,6 +235,7 @@ func (a app) commandUpdateAll(opts globalOptions, yes bool) error {
 		if answer != "y" && answer != "yes" {
 			fmt.Fprintln(a.stdout, "update cancelled")
 			if failed != 0 {
+				fmt.Fprintf(a.stdout, "summary: 0 updated, %d failed\n", failed)
 				return exitError{code: 1}
 			}
 			return nil

@@ -13,6 +13,7 @@ import (
 )
 
 type app struct {
+	stdin  io.Reader
 	stdout io.Writer
 	stderr io.Writer
 }
@@ -28,7 +29,11 @@ var errHelp = errors.New("help requested")
 var version = "dev"
 
 func RunCLI(args []string, stdout, stderr io.Writer) int {
-	a := app{stdout: stdout, stderr: stderr}
+	return runCLI(args, os.Stdin, stdout, stderr)
+}
+
+func runCLI(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	a := app{stdin: stdin, stdout: stdout, stderr: stderr}
 	if err := a.run(args); err != nil {
 		if errors.Is(err, errHelp) {
 			return 0
@@ -67,6 +72,8 @@ func (a app) run(args []string) error {
 	switch command {
 	case "init":
 		return a.commandInit(commandArgs)
+	case "skill":
+		return a.commandSkill(commandArgs)
 	case "status":
 		return a.commandWithOptionalContext(command, commandArgs, opts, a.commandStatus)
 	case "verify":
@@ -175,6 +182,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Commands:")
 	fmt.Fprintln(w, "  init [path]")
+	fmt.Fprintln(w, "  skill <install|remove|status>")
 	fmt.Fprintln(w, "  status [tool_or_path]")
 	fmt.Fprintln(w, "  verify [tool_or_path]")
 	fmt.Fprintln(w, "  check [tool_or_path]")
@@ -189,6 +197,8 @@ func printCommandUsage(w io.Writer, command string) {
 	switch command {
 	case "init":
 		fmt.Fprintln(w, "Usage: pin init [--name NAME] [--source PATH] [--entrypoint NAME] [--requirements PATH] [--inject PATH] [--branch BRANCH] [--remote REMOTE] [--preflight COMMAND] [--verify COMMAND] [path]")
+	case "skill":
+		printSkillUsage(w)
 	case "status", "verify", "check", "update", "rollback":
 		fmt.Fprintf(w, "Usage: pin %s [tool_or_path]\n", command)
 	case "run":

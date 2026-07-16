@@ -14,6 +14,37 @@ Install the `pin` CLI with Homebrew:
 brew install jdblackstar/tap/pin
 ```
 
+## Install the agent skill
+
+Install the bundled `pin` skill so supported coding agents can discover how to
+initialize, update, verify, run, and roll back PIN-managed tools:
+
+```bash
+pin skill install
+```
+
+PIN detects Codex, Claude Code, and Cursor, shows the destinations it found,
+and asks before writing to them. If PIN detects an initialized Relay config,
+Relay becomes the only default destination and distributes the skill to the
+skill-capable tools enabled in Relay. Use explicit targets to override
+detection:
+
+```bash
+pin skill install --target codex
+pin skill install --target claude --target cursor
+```
+
+Direct installs use the agents' global skill directories. PIN records a digest
+next to the installed skill so upgrades are idempotent and locally modified or
+unmanaged skills are not replaced without `--force`.
+
+Inspect or remove the installed skill with:
+
+```bash
+pin skill status
+pin skill remove
+```
+
 ## What pin Does
 
 - reads a repo-local `pin.toml`
@@ -230,6 +261,9 @@ runtime files added alongside the repo contents:
 
 ```bash
 pin init [path]
+pin skill install [--target TARGET] [--yes] [--force]
+pin skill remove [--target TARGET] [--yes] [--force]
+pin skill status [--target TARGET]
 pin status [tool_or_path]
 pin check [tool_or_path]
 pin update [tool_or_path]

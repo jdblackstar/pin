@@ -1,3 +1,4 @@
 /pin
+.pin-dev/
 *.test
 coverage.out

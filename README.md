@@ -231,9 +231,9 @@ runtime files added alongside the repo contents:
 ```bash
 pin init [path]
 pin status [tool_or_path]
-pin check [tool_or_path]
-pin update [tool_or_path]
-pin verify [tool_or_path]
+pin check [tool_or_path | --all]
+pin update [tool_or_path | --all [--yes]]
+pin verify [tool_or_path | --all]
 pin rollback [tool_or_path]
 pin run tool [-- args...]
 pin list
@@ -244,6 +244,15 @@ pin version
 `tool_or_path` can be either a repo path containing `pin.toml` or an installed
 tool name. Commands that need source state, such as `update` and `check`, need
 the config from the repo path or from release metadata.
+
+Use `--all` with `verify`, `check`, or `update` to operate on every installed
+tool. `verify --all` validates every active release and runs its configured
+verification commands. `check --all` compares every active release with its
+configured source branch. `update --all` checks first, shows the non-current
+tools, and prompts once before updating them; pass `--yes` to skip the prompt in
+automation. All three commands continue after per-tool failures, print a
+summary, and exit nonzero if any tool fails. `--all` cannot be combined with a
+tool name or path.
 
 By default, new installs live under `~/.local/share/pin/<tool>`. Existing
 installs from older versions under `~/.local/share/<tool>` remain supported and

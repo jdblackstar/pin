@@ -21,11 +21,15 @@ type cliResult struct {
 type pinRunner func(t *testing.T, root string, args ...string) cliResult
 
 func runPin(t *testing.T, root string, args ...string) cliResult {
+	return runPinWithInput(t, root, "", args...)
+}
+
+func runPinWithInput(t *testing.T, root, input string, args ...string) cliResult {
 	t.Helper()
 	prepareToolEnv(t, root)
 	var stdout, stderr bytes.Buffer
 	allArgs := append([]string{"--pin-home", filepath.Join(root, "share")}, args...)
-	code := RunCLI(allArgs, &stdout, &stderr)
+	code := runCLI(allArgs, strings.NewReader(input), &stdout, &stderr)
 	return cliResult{code: code, stdout: stdout.String(), stderr: stderr.String()}
 }
 
@@ -282,6 +286,26 @@ func sourceRepo(t *testing.T, root string) (string, string) {
 	return repo, git(t, repo, "rev-parse", "HEAD")
 }
 
+func namedSourceRepo(t *testing.T, root, name string) (string, string) {
+	t.Helper()
+	repo, _ := sourceRepo(t, root)
+	replaceInFile(t, filepath.Join(repo, "pin.toml"), `name = "demo-tool"`, "name = \""+name+"\"\nentrypoint = \"demo-tool\"")
+	git(t, repo, "add", "pin.toml")
+	git(t, repo, "commit", "-m", "name tool")
+	git(t, repo, "push")
+	return repo, git(t, repo, "rev-parse", "HEAD")
+}
+
+func commitNamedToolVersion(t *testing.T, repo, name, version string) string {
+	t.Helper()
+	writeTool(t, repo, version)
+	replaceInFile(t, filepath.Join(repo, "pin.toml"), `name = "demo-tool"`, "name = \""+name+"\"\nentrypoint = \"demo-tool\"")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-m", "update")
+	git(t, repo, "push")
+	return git(t, repo, "rev-parse", "HEAD")
+}
+
 func run(t *testing.T, cwd string, name string, args ...string) string {
 	t.Helper()
 	command := exec.Command(name, args...)
@@ -332,8 +356,12 @@ func legacyHomeToolRoot(root string) string {
 }
 
 func requireReleaseLink(t *testing.T, root, linkName, sha string) {
+	requireReleaseLinkForTool(t, root, "demo-tool", linkName, sha)
+}
+
+func requireReleaseLinkForTool(t *testing.T, root, tool, linkName, sha string) {
 	t.Helper()
-	target, err := filepath.EvalSymlinks(filepath.Join(root, "share", "demo-tool", linkName))
+	target, err := filepath.EvalSymlinks(filepath.Join(root, "share", tool, linkName))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -423,6 +451,109 @@ func setReleaseVerifyToFailWhenActive(t *testing.T, metadataPath, currentLink, m
 
 func TestUpdateStatusVerifyAndList(t *testing.T) {
 	testUpdateStatusVerifyAndList(t, runPin)
+}
+
+func TestVerifyCheckAndUpdateAll(t *testing.T) {
+	root := t.TempDir()
+	alphaRepo, alphaOldSHA := namedSourceRepo(t, filepath.Join(root, "alpha-source"), "alpha")
+	betaRepo, _ := namedSourceRepo(t, filepath.Join(root, "beta-source"), "beta")
+
+	for _, repo := range []string{alphaRepo, betaRepo} {
+		result := runPin(t, root, "update", repo)
+		requireCode(t, result, 0)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "share", "orphaned"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	result := runPin(t, root, "verify", "--all")
+	requireCode(t, result, 0)
+	requireContains(t, result.stdout, "summary: 2 passed, 0 failed")
+	if strings.Index(result.stdout, "verified: alpha ") > strings.Index(result.stdout, "verified: beta ") {
+		t.Fatalf("verify --all output is not sorted:\n%s", result.stdout)
+	}
+
+	result = runPin(t, root, "check", "--all")
+	requireCode(t, result, 0)
+	requireContains(t, result.stdout, "summary: 2 current, 0 non-current, 0 failed")
+
+	alphaNewSHA := commitNamedToolVersion(t, alphaRepo, "alpha", "2")
+	result = runPin(t, root, "check", "--all")
+	requireCode(t, result, 1)
+	requireContains(t, result.stdout, "tool: alpha")
+	requireContains(t, result.stdout, "status: behind")
+	requireContains(t, result.stdout, "summary: 1 current, 1 non-current, 0 failed")
+
+	result = runPinWithInput(t, root, "n\n", "update", "--all")
+	requireCode(t, result, 0)
+	requireContains(t, result.stdout, "update available: alpha (behind, "+alphaOldSHA+" -> "+alphaNewSHA+")")
+	requireContains(t, result.stdout, "Update 1 tool? [y/N]")
+	requireContains(t, result.stdout, "update cancelled")
+	requireReleaseLinkForTool(t, root, "alpha", "current", alphaOldSHA)
+
+	result = runPin(t, root, "update", "--all", "--yes")
+	requireCode(t, result, 0)
+	requireContains(t, result.stdout, "updated: alpha "+alphaNewSHA)
+	requireContains(t, result.stdout, "summary: 1 updated, 0 failed")
+	requireReleaseLinkForTool(t, root, "alpha", "current", alphaNewSHA)
+}
+
+func TestUpdateAllCancellationSummarizesPrecheckFailures(t *testing.T) {
+	root := t.TempDir()
+	alphaRepo, _ := namedSourceRepo(t, filepath.Join(root, "alpha-source"), "alpha")
+	betaRepo, _ := namedSourceRepo(t, filepath.Join(root, "beta-source"), "beta")
+	for _, repo := range []string{alphaRepo, betaRepo} {
+		result := runPin(t, root, "update", repo)
+		requireCode(t, result, 0)
+	}
+
+	commitNamedToolVersion(t, alphaRepo, "alpha", "2")
+	if err := os.Rename(betaRepo, betaRepo+"-missing"); err != nil {
+		t.Fatal(err)
+	}
+
+	result := runPinWithInput(t, root, "n\n", "update", "--all")
+	requireCode(t, result, 1)
+	requireContains(t, result.stderr, "failed: beta:")
+	requireContains(t, result.stdout, "update cancelled")
+	requireContains(t, result.stdout, "summary: 0 updated, 1 failed")
+}
+
+func TestVerifyAllContinuesAfterFailure(t *testing.T) {
+	root := t.TempDir()
+	alphaRepo, alphaSHA := namedSourceRepo(t, filepath.Join(root, "alpha-source"), "alpha")
+	betaRepo, betaSHA := namedSourceRepo(t, filepath.Join(root, "beta-source"), "beta")
+	for _, repo := range []string{alphaRepo, betaRepo} {
+		result := runPin(t, root, "update", repo)
+		requireCode(t, result, 0)
+	}
+
+	entrypoint := filepath.Join(root, "share", "alpha", "releases", alphaSHA, venvDir, "bin", "demo-tool")
+	if err := os.Remove(entrypoint); err != nil {
+		t.Fatal(err)
+	}
+	result := runPin(t, root, "verify", "--all")
+	requireCode(t, result, 1)
+	requireContains(t, result.stderr, "failed: alpha: check entrypoint: missing entrypoint")
+	requireContains(t, result.stdout, "verified: beta "+betaSHA)
+	requireContains(t, result.stdout, "summary: 1 passed, 1 failed")
+}
+
+func TestAllCommandOptionValidation(t *testing.T) {
+	root := t.TempDir()
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"verify", "--all", "."}, "verify --all cannot be combined with a tool or path"},
+		{[]string{"check", "--all", "."}, "check --all cannot be combined with a tool or path"},
+		{[]string{"update", "--all", "."}, "update --all cannot be combined with a tool or path"},
+		{[]string{"update", "--yes"}, "update --yes requires --all"},
+	} {
+		result := runPin(t, root, tc.args...)
+		requireCode(t, result, 2)
+		requireContains(t, result.stderr, tc.want)
+	}
 }
 
 func TestDefaultPinHomeUsesNamespacedLayout(t *testing.T) {
@@ -785,6 +916,9 @@ func TestE2ECompiledBinaryLifecycle(t *testing.T) {
 	result = runTool(t, runCompiledPin, root, repo, "verify")
 	requireCode(t, result, 0)
 	requireContains(t, result.stdout, "verified: demo-tool "+oldSHA)
+	result = runCompiledPin(t, root, "verify", "--all")
+	requireCode(t, result, 0)
+	requireContains(t, result.stdout, "summary: 1 passed, 0 failed")
 
 	result = runCompiledPin(t, root, "list")
 	requireCode(t, result, 0)
@@ -793,6 +927,9 @@ func TestE2ECompiledBinaryLifecycle(t *testing.T) {
 	result = runTool(t, runCompiledPin, root, repo, "check")
 	requireCode(t, result, 0)
 	requireContains(t, result.stdout, "status: current")
+	result = runCompiledPin(t, root, "check", "--all")
+	requireCode(t, result, 0)
+	requireContains(t, result.stdout, "summary: 1 current, 0 non-current, 0 failed")
 
 	newSHA := commitToolVersion(t, repo, "2", false)
 	git(t, repo, "push")
@@ -803,7 +940,7 @@ func TestE2ECompiledBinaryLifecycle(t *testing.T) {
 	requireContains(t, result.stdout, "target: "+newSHA)
 	requireContains(t, result.stdout, "status: behind")
 
-	result = runTool(t, runCompiledPin, root, repo, "update")
+	result = runCompiledPin(t, root, "update", "--all", "--yes")
 	requireCode(t, result, 0)
 	requireContains(t, result.stdout, "updated: demo-tool "+newSHA)
 	requireInstalledVersion(t, root, "2")

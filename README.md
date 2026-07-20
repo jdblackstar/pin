@@ -71,6 +71,50 @@ If an update is bad, swap back to the previous release:
 pin rollback daily-report
 ```
 
+## Test the Current Checkout
+
+Use the development shell to explore unreleased CLI behavior without replacing
+the installed `pin` or reading its live releases:
+
+```bash
+scripts/dev-shell ux-test
+```
+
+The helper builds the current checkout, labels it with the commit SHA (and
+`-dirty` when applicable), and prepends the candidate to `PATH`. It also sets
+`PIN_HOME` to the persistent, named profile at
+`~/.local/share/pin-dev/profiles/ux-test`. Inside the shell,
+`command -v pin` points at `.pin-dev/bin/pin`; exiting restores the caller's
+normal environment. Bash and zsh load their normal startup files before the
+helper adds a `[pin dev:ux-test]` prompt prefix. Go's normal shared build cache
+remains available.
+
+Reset only that profile's functional state with:
+
+```bash
+scripts/dev-reset ux-test
+```
+
+For automation or a quick smoke check, run one command in the same scoped
+environment while preserving its exit code:
+
+```bash
+scripts/dev-shell ux-test -- pin version
+```
+
+An interactive UX walkthrough can use a disposable tool repository and cover:
+
+1. Run `pin update /path/to/tool`, then `pin status`, `pin verify`, and `pin check`.
+2. Push a tool change and run `pin update` again to exercise the update path.
+3. Add a second tool and exercise `pin verify --all`, `pin check --all`, and
+   `pin update --all`, answering both yes and no at the confirmation prompt.
+4. Run `pin rollback <tool>` and verify the prior release is active.
+5. Exit, then run `command -v pin` and `pin version` in the parent shell to
+   confirm the normally installed CLI is restored.
+
+The candidate uses the real CLI code paths, prompts, and exit codes. Profile
+data survives between shell sessions until explicitly reset.
+
 ## Choosing `source`
 
 Every `pin.toml` has one install target:

@@ -1,0 +1,36 @@
+#!/bin/sh
+
+set -eu
+
+usage() {
+	echo "Usage: scripts/dev-reset profile"
+}
+
+if [ "$#" -ne 1 ]; then
+	usage >&2
+	exit 2
+fi
+
+profile=$1
+case "$profile" in
+	*[!A-Za-z0-9._-]*|[!A-Za-z0-9]*|'')
+		echo "dev-reset: invalid profile name: $profile" >&2
+		exit 2
+		;;
+esac
+
+if [ -n "${PIN_DEV_HOME-}" ]; then
+	dev_home=$PIN_DEV_HOME
+else
+	data_home=${XDG_DATA_HOME:-"$HOME/.local/share"}
+	dev_home="$data_home/pin-dev"
+fi
+
+profile_home="$dev_home/profiles/$profile"
+if [ ! -e "$profile_home" ]; then
+	echo "pin development profile '$profile' is already empty"
+	exit 0
+fi
+
+rm -rf "$profile_home"
+echo "reset pin development profile '$profile'"

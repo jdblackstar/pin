@@ -144,6 +144,10 @@ func TestDevShellPromptSurvivesStartupFiles(t *testing.T) {
 }
 
 func TestDevScriptsRejectUnsafeProfileNames(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("development scripts are POSIX-only")
+	}
+
 	for _, script := range []string{"dev-shell", "dev-reset"} {
 		command := exec.Command(filepath.Join("scripts", script), "../live")
 		output, err := command.CombinedOutput()

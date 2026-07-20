@@ -85,7 +85,9 @@ The helper builds the current checkout, labels it with the commit SHA (and
 `PIN_HOME` to the persistent, named profile at
 `~/.local/share/pin-dev/profiles/ux-test`. Inside the shell,
 `command -v pin` points at `.pin-dev/bin/pin`; exiting restores the caller's
-normal environment. Go's normal shared build cache remains available.
+normal environment. Bash and zsh load their normal startup files before the
+helper adds a `[pin dev:ux-test]` prompt prefix. Go's normal shared build cache
+remains available.
 
 Reset only that profile's functional state with:
 

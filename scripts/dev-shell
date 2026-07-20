@@ -79,12 +79,27 @@ if [ "$#" -gt 0 ]; then
 fi
 
 shell=${SHELL:-/bin/sh}
-PS1="[pin dev:$profile] ${PS1-\$ }"
-PROMPT="$PS1"
-export PS1 PROMPT
 
 echo "pin development shell (profile: $profile)"
 echo "candidate: $candidate ($version)"
 echo "PIN_HOME: $PIN_HOME"
 echo "Exit this shell to restore your normal pin environment."
-exec "$shell" -i
+
+case "${shell##*/}" in
+	bash)
+		export PIN_DEV_ORIGINAL_BASHRC=${PIN_DEV_ORIGINAL_BASHRC:-"$HOME/.bashrc"}
+		exec "$shell" --rcfile "$repo/scripts/dev-shell-rc/bashrc" -i
+		;;
+	zsh)
+		export PIN_DEV_ORIGINAL_ZDOTDIR=${PIN_DEV_ORIGINAL_ZDOTDIR:-${ZDOTDIR:-$HOME}}
+		export PIN_DEV_WRAPPER_ZDOTDIR="$repo/scripts/dev-shell-rc/zsh"
+		export ZDOTDIR="$PIN_DEV_WRAPPER_ZDOTDIR"
+		exec "$shell" -i
+		;;
+	*)
+		PS1="[pin dev:$profile] ${PS1-\$ }"
+		PROMPT="$PS1"
+		export PS1 PROMPT
+		exec "$shell" -i
+		;;
+esac

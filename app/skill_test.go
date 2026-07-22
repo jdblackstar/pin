@@ -373,8 +373,71 @@ func TestSkillRemoveDefaultsToNo(t *testing.T) {
 	}
 	requireContains(t, result.stdout, "[y/N]")
 	requireContains(t, result.stdout, "cancelled")
+	if strings.Contains(result.stdout, "compatibility copy") {
+		t.Fatalf("remove prompt mentioned a missing compatibility copy: %q", result.stdout)
+	}
 	if !pathExists(canonical) {
 		t.Fatal("default removal confirmation deleted the skill")
+	}
+}
+
+func TestSkillRemovePromptIncludesExistingCompatibilityCopy(t *testing.T) {
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, ".claude"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	result := runSkillCLI(t, home, "", "skill", "install", "--yes")
+	if result.code != 0 {
+		t.Fatalf("install failed: %s", result.stderr)
+	}
+
+	result = runSkillCLI(t, home, "n\n", "skill", "remove")
+	if result.code != 0 {
+		t.Fatalf("cancel failed: %s", result.stderr)
+	}
+	requireContains(t, result.stdout, "and its standard compatibility copy")
+}
+
+func TestSkillRemoveRollsBackWhenSecondTargetCannotBeStaged(t *testing.T) {
+	home := t.TempDir()
+	canonical := filepath.Join(home, ".agents", "skills", "pin")
+	compatibility := filepath.Join(home, ".claude", "skills", "pin")
+	for _, path := range []string{canonical, compatibility} {
+		if _, err := installSkillAt(path, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rename := func(oldPath, newPath string) error {
+		if oldPath == compatibility {
+			return errors.New("injected compatibility removal failure")
+		}
+		return os.Rename(oldPath, newPath)
+	}
+	removed, err := removeSkillTargetsWithOps(
+		[]skillTarget{{path: canonical}, {path: compatibility}},
+		false,
+		rename,
+		os.RemoveAll,
+	)
+	if err == nil {
+		t.Fatal("removal unexpectedly succeeded")
+	}
+	if len(removed) != 0 {
+		t.Fatalf("removed paths = %#v, want none", removed)
+	}
+	for _, path := range []string{canonical, compatibility} {
+		state, inspectErr := inspectSkillAt(path)
+		if inspectErr != nil || state != skillCurrent {
+			t.Fatalf("restored state for %s = %s, err=%v", path, state, inspectErr)
+		}
+		matches, globErr := filepath.Glob(filepath.Join(filepath.Dir(path), ".pin-skill-remove-*"))
+		if globErr != nil {
+			t.Fatal(globErr)
+		}
+		if len(matches) != 0 {
+			t.Fatalf("rollback left temporary paths for %s: %#v", path, matches)
+		}
 	}
 }
 

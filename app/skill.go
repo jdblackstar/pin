@@ -251,9 +251,17 @@ func (a app) commandSkillRemove(args []string) error {
 	if err != nil {
 		return err
 	}
+	compatibilityCopy := env.claude.detected || pathExists(env.claude.path)
 	if !opts.yes {
+		prompt := fmt.Sprintf("Remove the PIN skill at %s? [y/N] ", env.canonical.path)
+		if compatibilityCopy {
+			prompt = fmt.Sprintf(
+				"Remove the PIN skill at %s and its standard compatibility copy? [y/N] ",
+				env.canonical.path,
+			)
+		}
 		confirmed, err := a.confirmSkillMutation(
-			fmt.Sprintf("Remove the PIN skill at %s and its standard compatibility copy? [y/N] ", env.canonical.path),
+			prompt,
 			false,
 		)
 		if err != nil {
@@ -269,25 +277,11 @@ func (a app) commandSkillRemove(args []string) error {
 	if pathExists(env.claude.path) {
 		targets = append(targets, env.claude)
 	}
-	for _, target := range targets {
-		state, err := inspectSkillAt(target.path)
-		if err != nil {
-			return err
-		}
-		if (state == skillModified || state == skillUnmanaged) && !opts.force {
-			return fmt.Errorf("%s skill is %s; inspect it or rerun with --force", target.path, state)
-		}
+	removed, removeErr := removeSkillTargets(targets, opts.force)
+	for _, path := range removed {
+		fmt.Fprintf(a.stdout, "removed skill: %s\n", path)
 	}
-	for _, target := range targets {
-		removed, err := removeSkillAt(target.path, opts.force)
-		if err != nil {
-			return err
-		}
-		if removed {
-			fmt.Fprintf(a.stdout, "removed skill: %s\n", target.path)
-		}
-	}
-	return nil
+	return removeErr
 }
 
 func (a app) commandSkillStatus(args []string) error {
@@ -463,41 +457,127 @@ func installSkillAtWithRename(path string, force bool, rename func(string, strin
 }
 
 func removeSkillAt(path string, force bool) (bool, error) {
-	state, err := inspectSkillAt(path)
-	if err != nil {
-		return false, err
-	}
-	if state == skillMissing {
-		return false, nil
-	}
-	if (state == skillModified || state == skillUnmanaged) && !force {
-		return false, fmt.Errorf("%s skill is %s; inspect it or rerun with --force", path, state)
-	}
-	return true, removeSkillPath(path)
+	removed, err := removeSkillTargets([]skillTarget{{path: path}}, force)
+	return len(removed) != 0, err
 }
 
-func removeSkillPath(path string) error {
-	info, err := os.Lstat(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
+type stagedSkillRemoval struct {
+	originalPath string
+	tempRoot     string
+	stagedPath   string
+}
+
+func removeSkillTargets(targets []skillTarget, force bool) ([]string, error) {
+	return removeSkillTargetsWithOps(targets, force, os.Rename, os.RemoveAll)
+}
+
+func removeSkillTargetsWithOps(
+	targets []skillTarget,
+	force bool,
+	rename func(string, string) error,
+	removeAll func(string) error,
+) ([]string, error) {
+	for _, target := range targets {
+		state, err := inspectSkillAt(target.path)
+		if err != nil {
+			return nil, err
+		}
+		if (state == skillModified || state == skillUnmanaged) && !force {
+			return nil, fmt.Errorf("%s skill is %s; inspect it or rerun with --force", target.path, state)
+		}
 	}
+
+	var staged []stagedSkillRemoval
+	rollback := func(cause error) ([]string, error) {
+		if rollbackErr := rollbackSkillRemovals(staged, rename, removeAll); rollbackErr != nil {
+			return nil, errors.Join(cause, rollbackErr)
+		}
+		return nil, cause
+	}
+	for _, target := range targets {
+		removal, err := stageSkillRemoval(target.path, rename, removeAll)
+		if err != nil {
+			return rollback(fmt.Errorf("stage removal of %s: %w", target.path, err))
+		}
+		if removal == nil {
+			continue
+		}
+		staged = append(staged, *removal)
+
+		state, err := inspectSkillAt(removal.stagedPath)
+		if err != nil {
+			return rollback(fmt.Errorf("inspect staged skill %s: %w", target.path, err))
+		}
+		if (state == skillModified || state == skillUnmanaged) && !force {
+			return rollback(fmt.Errorf("%s skill became %s during removal; no skills were removed", target.path, state))
+		}
+	}
+
+	removed := make([]string, 0, len(staged))
+	var cleanupErrors []error
+	for _, removal := range staged {
+		removed = append(removed, removal.originalPath)
+		if err := removeAll(removal.tempRoot); err != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf(
+				"%s was removed, but cleanup failed; recovery copy remains at %s: %w",
+				removal.originalPath,
+				removal.stagedPath,
+				err,
+			))
+		}
+	}
+	return removed, errors.Join(cleanupErrors...)
+}
+
+func stageSkillRemoval(
+	path string,
+	rename func(string, string) error,
+	removeAll func(string) error,
+) (*stagedSkillRemoval, error) {
+	if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	} else if err != nil {
+		return nil, err
+	}
+
+	tempRoot, err := os.MkdirTemp(filepath.Dir(path), ".pin-skill-remove-")
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-		return os.Remove(path)
+	stagedPath := filepath.Join(tempRoot, pinSkillName)
+	if err := rename(path, stagedPath); err != nil {
+		_ = removeAll(tempRoot)
+		return nil, err
 	}
-	parent := filepath.Dir(path)
-	tempRoot, err := os.MkdirTemp(parent, ".pin-skill-remove-")
-	if err != nil {
-		return err
+	return &stagedSkillRemoval{
+		originalPath: path,
+		tempRoot:     tempRoot,
+		stagedPath:   stagedPath,
+	}, nil
+}
+
+func rollbackSkillRemovals(
+	staged []stagedSkillRemoval,
+	rename func(string, string) error,
+	removeAll func(string) error,
+) error {
+	var rollbackErrors []error
+	for i := len(staged) - 1; i >= 0; i-- {
+		removal := staged[i]
+		if err := rename(removal.stagedPath, removal.originalPath); err != nil {
+			rollbackErrors = append(rollbackErrors, fmt.Errorf(
+				"restore %s failed; recovery copy remains at %s: %w",
+				removal.originalPath,
+				removal.stagedPath,
+				err,
+			))
+			continue
+		}
+		if err := removeAll(removal.tempRoot); err != nil {
+			rollbackErrors = append(rollbackErrors, fmt.Errorf("clean rollback directory %s: %w", removal.tempRoot, err))
+		}
 	}
-	defer os.RemoveAll(tempRoot)
-	removed := filepath.Join(tempRoot, pinSkillName)
-	if err := os.Rename(path, removed); err != nil {
-		return err
-	}
-	return os.RemoveAll(removed)
+	return errors.Join(rollbackErrors...)
 }
 
 func inspectSkillAt(path string) (skillInstallState, error) {

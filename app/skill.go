@@ -2,6 +2,7 @@ package app
 
 import (
 	"bufio"
+	"context"
 	"crypto/sha256"
 	_ "embed"
 	"encoding/hex"
@@ -9,24 +10,25 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"hash"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
-
-	"github.com/BurntSushi/toml"
+	"time"
 )
 
 const (
-	pinSkillName        = "pin"
-	skillMarkerName     = "pin-managed.json"
-	skillMarkerSchema   = 1
-	skillTargetRelay    = "relay"
-	skillTargetCodex    = "codex"
-	skillTargetClaude   = "claude"
-	skillTargetCursor   = "cursor"
-	skillTargetOpenCode = "opencode"
+	pinSkillName                   = "pin"
+	skillMarkerName                = "pin-managed.json"
+	skillMarkerSchema              = 2
+	legacySkillMarkerSchema        = 1
+	relayCapabilitiesSchema        = 1
+	relayScopedSkillSyncCapability = "skills.sync.scoped"
+	relayScopedSkillSyncVersion    = 1
+	relayCapabilitiesTimeout       = 2 * time.Second
+	relayScopedSkillSyncTimeout    = 30 * time.Second
 )
 
 //go:embed assets/pin-skill/SKILL.md
@@ -49,33 +51,93 @@ const (
 )
 
 type skillTarget struct {
-	label    string
 	path     string
 	detected bool
 }
 
-type relaySkillConfig struct {
-	configPath      string
-	lockPath        string
-	centralSkillDir string
-	targetSkillDirs map[string]string
-	enabledTools    map[string]bool
-	relayExecutable string
-}
-
 type skillEnvironment struct {
-	relay  *relaySkillConfig
-	direct map[string]skillTarget
+	canonical skillTarget
+	claude    skillTarget
 }
 
 type skillMutationOptions struct {
-	targets repeatedStringFlag
-	yes     bool
-	force   bool
+	yes   bool
+	force bool
 }
 
-type skillStatusOptions struct {
-	targets repeatedStringFlag
+type relayCapabilities struct {
+	SchemaVersion int            `json:"schema_version"`
+	Capabilities  map[string]int `json:"capabilities"`
+}
+
+// relayAdapter is the only process boundary between PIN and Relay. Keep all
+// capability negotiation and subprocess argv here so Relay's optional contract
+// can evolve without leaking into skill lifecycle code.
+type relayAdapter struct {
+	executable string
+}
+
+func findRelayAdapter() (relayAdapter, bool) {
+	executable, err := exec.LookPath("relay")
+	if err != nil {
+		return relayAdapter{}, false
+	}
+	return relayAdapter{executable: executable}, true
+}
+
+func (relay relayAdapter) supportsScopedSkillSync() bool {
+	output, err := relay.run(relayCapabilitiesTimeout, "capabilities", "--json")
+	if err != nil {
+		return false
+	}
+	var capabilities relayCapabilities
+	if err := json.Unmarshal(output, &capabilities); err != nil {
+		return false
+	}
+	return capabilities.SchemaVersion == relayCapabilitiesSchema &&
+		capabilities.Capabilities[relayScopedSkillSyncCapability] >= relayScopedSkillSyncVersion
+}
+
+func (relay relayAdapter) syncSkill(path string) error {
+	_, err := relay.run(
+		relayScopedSkillSyncTimeout,
+		"sync", "skill", "--quiet", "--fail-on-conflict", path,
+	)
+	if err != nil {
+		return fmt.Errorf("scoped skill sync: %w", err)
+	}
+	return nil
+}
+
+func (relay relayAdapter) run(timeout time.Duration, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	command := exec.CommandContext(ctx, relay.executable, args...)
+	output, err := command.Output()
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return nil, fmt.Errorf("relay command timed out")
+	}
+	return output, err
+}
+
+func printSkillUsage(w io.Writer) {
+	fmt.Fprintln(w, "Usage: pin skill <command> [options]")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Commands:")
+	fmt.Fprintln(w, "  install [--yes] [--force]")
+	fmt.Fprintln(w, "  remove  [--yes] [--force]")
+	fmt.Fprintln(w, "  status")
+}
+
+func printSkillCommandUsage(w io.Writer, command string) {
+	switch command {
+	case "install", "remove":
+		fmt.Fprintf(w, "Usage: pin skill %s [--yes] [--force]\n", command)
+	case "status":
+		fmt.Fprintln(w, "Usage: pin skill status")
+	default:
+		printSkillUsage(w)
+	}
 }
 
 func (a app) commandSkill(args []string) error {
@@ -100,28 +162,6 @@ func (a app) commandSkill(args []string) error {
 	}
 }
 
-func printSkillUsage(w io.Writer) {
-	fmt.Fprintln(w, "Usage: pin skill <command> [options]")
-	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Commands:")
-	fmt.Fprintln(w, "  install [--target TARGET] [--yes] [--force]")
-	fmt.Fprintln(w, "  remove  [--target TARGET] [--yes] [--force]")
-	fmt.Fprintln(w, "  status  [--target TARGET]")
-	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Targets: relay, codex, claude, cursor")
-}
-
-func printSkillCommandUsage(w io.Writer, command string) {
-	switch command {
-	case "install", "remove":
-		fmt.Fprintf(w, "Usage: pin skill %s [--target TARGET] [--yes] [--force]\n", command)
-	case "status":
-		fmt.Fprintln(w, "Usage: pin skill status [--target TARGET]")
-	default:
-		printSkillUsage(w)
-	}
-}
-
 func (a app) commandSkillInstall(args []string) error {
 	opts, err := parseSkillMutationOptions("install", args, a.stdout)
 	if err != nil {
@@ -131,12 +171,19 @@ func (a app) commandSkillInstall(args []string) error {
 	if err != nil {
 		return err
 	}
-	targets, inferred, err := mutationSkillTargets(env, opts.targets)
-	if err != nil {
-		return err
-	}
-	if inferred && !opts.yes {
-		confirmed, err := a.confirmSkillMutation("Install", targets, env)
+	if !opts.yes {
+		prompt := fmt.Sprintf("Install the PIN skill at %s? [Y/n] ", env.canonical.path)
+		if env.claude.detected {
+			prompt = fmt.Sprintf(
+				"Install the PIN skill at %s and, if needed, a Claude Code compatibility copy at %s? [Y/n] ",
+				env.canonical.path,
+				env.claude.path,
+			)
+		}
+		confirmed, err := a.confirmSkillMutation(
+			prompt,
+			true,
+		)
 		if err != nil {
 			return err
 		}
@@ -146,25 +193,53 @@ func (a app) commandSkillInstall(args []string) error {
 		}
 	}
 
-	for _, targetName := range targets {
-		if targetName == skillTargetRelay {
-			if err := a.installRelaySkill(env.relay, opts.force); err != nil {
-				return err
+	changed, err := installSkillAt(env.canonical.path, opts.force)
+	if err != nil {
+		return fmt.Errorf("install canonical skill: %w", err)
+	}
+	printSkillInstallResult(a.stdout, changed, "skill", env.canonical.path)
+
+	relay, found := findRelayAdapter()
+	var relaySyncErr error
+	if found && relay.supportsScopedSkillSync() {
+		relaySyncErr = relay.syncSkill(env.canonical.path)
+		if relaySyncErr == nil {
+			return nil
+		}
+	}
+
+	fallbackUsed := false
+	if env.claude.detected {
+		fallbackChanged, fallbackErr := installSkillAt(env.claude.path, opts.force)
+		if fallbackErr != nil {
+			if relaySyncErr != nil {
+				return fmt.Errorf(
+					"canonical skill remains installed, but Relay sync failed (%v) and the Claude Code compatibility copy could not be installed: %w",
+					relaySyncErr,
+					fallbackErr,
+				)
 			}
-			continue
+			return fmt.Errorf("canonical skill remains installed, but install Claude Code compatibility copy: %w", fallbackErr)
 		}
-		target := env.direct[targetName]
-		changed, err := installSkillAt(target.path, opts.force)
-		if err != nil {
-			return fmt.Errorf("install %s skill: %w", targetName, err)
+		fallbackUsed = true
+		printSkillInstallResult(a.stdout, fallbackChanged, "compatibility copy", env.claude.path)
+	}
+	if relaySyncErr != nil {
+		if fallbackUsed {
+			fmt.Fprintf(a.stderr, "pin: warning: Relay could not synchronize compatibility copies; used the standalone fallback: %v\n", relaySyncErr)
+		} else {
+			fmt.Fprintf(a.stderr, "pin: warning: Relay could not synchronize compatibility copies; the canonical skill remains installed: %v\n", relaySyncErr)
 		}
-		verb := "unchanged"
-		if changed {
-			verb = "installed"
-		}
-		fmt.Fprintf(a.stdout, "%s: %s %s\n", verb, targetName, target.path)
 	}
 	return nil
+}
+
+func printSkillInstallResult(w io.Writer, changed bool, kind, path string) {
+	verb := "unchanged"
+	if changed {
+		verb = "installed"
+	}
+	fmt.Fprintf(w, "%s %s: %s\n", verb, kind, path)
 }
 
 func (a app) commandSkillRemove(args []string) error {
@@ -176,12 +251,11 @@ func (a app) commandSkillRemove(args []string) error {
 	if err != nil {
 		return err
 	}
-	targets, inferred, err := mutationSkillTargets(env, opts.targets)
-	if err != nil {
-		return err
-	}
-	if inferred && !opts.yes {
-		confirmed, err := a.confirmSkillMutation("Remove", targets, env)
+	if !opts.yes {
+		confirmed, err := a.confirmSkillMutation(
+			fmt.Sprintf("Remove the PIN skill at %s and its standard compatibility copy? [y/N] ", env.canonical.path),
+			false,
+		)
 		if err != nil {
 			return err
 		}
@@ -191,66 +265,50 @@ func (a app) commandSkillRemove(args []string) error {
 		}
 	}
 
-	for _, targetName := range targets {
-		if targetName == skillTargetRelay {
-			removed, err := removeRelaySkill(env.relay, opts.force)
-			if err != nil {
-				return err
-			}
-			verb := "not installed"
-			if removed {
-				verb = "removed"
-			}
-			fmt.Fprintf(a.stdout, "%s: relay %s\n", verb, filepath.Join(env.relay.centralSkillDir, pinSkillName))
-			continue
+	targets := []skillTarget{env.canonical}
+	if pathExists(env.claude.path) {
+		targets = append(targets, env.claude)
+	}
+	for _, target := range targets {
+		state, err := inspectSkillAt(target.path)
+		if err != nil {
+			return err
 		}
-		target := env.direct[targetName]
+		if (state == skillModified || state == skillUnmanaged) && !opts.force {
+			return fmt.Errorf("%s skill is %s; inspect it or rerun with --force", target.path, state)
+		}
+	}
+	for _, target := range targets {
 		removed, err := removeSkillAt(target.path, opts.force)
 		if err != nil {
-			return fmt.Errorf("remove %s skill: %w", targetName, err)
+			return err
 		}
-		verb := "not installed"
 		if removed {
-			verb = "removed"
+			fmt.Fprintf(a.stdout, "removed skill: %s\n", target.path)
 		}
-		fmt.Fprintf(a.stdout, "%s: %s %s\n", verb, targetName, target.path)
 	}
 	return nil
 }
 
 func (a app) commandSkillStatus(args []string) error {
-	opts, err := parseSkillStatusOptions(args, a.stdout)
-	if err != nil {
+	if err := parseSkillStatusArgs(args, a.stdout); err != nil {
 		return err
 	}
 	env, err := detectSkillEnvironment()
 	if err != nil {
 		return err
 	}
-	targets, err := statusSkillTargets(opts.targets)
+	state, err := inspectSkillAt(env.canonical.path)
 	if err != nil {
-		return err
+		return fmt.Errorf("inspect canonical skill: %w", err)
 	}
-	for _, targetName := range targets {
-		if targetName == skillTargetRelay {
-			if env.relay == nil {
-				fmt.Fprintln(a.stdout, "relay: not configured")
-				continue
-			}
-			path := filepath.Join(env.relay.centralSkillDir, pinSkillName)
-			state, err := inspectSkillAt(path)
-			if err != nil {
-				return fmt.Errorf("inspect relay skill: %w", err)
-			}
-			fmt.Fprintf(a.stdout, "relay: %s path=%s distributes=%s\n", state, path, strings.Join(env.relay.enabledSkillTools(), ","))
-			continue
-		}
-		target := env.direct[targetName]
-		state, err := inspectSkillAt(target.path)
+	fmt.Fprintf(a.stdout, "pin: %s path=%s\n", state, env.canonical.path)
+	if env.claude.detected || pathExists(env.claude.path) {
+		state, err := inspectSkillAt(env.claude.path)
 		if err != nil {
-			return fmt.Errorf("inspect %s skill: %w", targetName, err)
+			return fmt.Errorf("inspect Claude Code compatibility copy: %w", err)
 		}
-		fmt.Fprintf(a.stdout, "%s: %s detected=%s path=%s\n", targetName, state, yesNo(target.detected), target.path)
+		fmt.Fprintf(a.stdout, "claude compatibility: %s detected=%s path=%s\n", state, yesNo(env.claude.detected), env.claude.path)
 	}
 	return nil
 }
@@ -259,7 +317,6 @@ func parseSkillMutationOptions(command string, args []string, stdout io.Writer) 
 	var opts skillMutationOptions
 	flags := flag.NewFlagSet("pin skill "+command, flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
-	flags.Var(&opts.targets, "target", "")
 	flags.BoolVar(&opts.yes, "yes", false, "")
 	flags.BoolVar(&opts.force, "force", false, "")
 	flags.Usage = func() { printSkillCommandUsage(stdout, command) }
@@ -275,101 +332,38 @@ func parseSkillMutationOptions(command string, args []string, stdout io.Writer) 
 	return opts, nil
 }
 
-func parseSkillStatusOptions(args []string, stdout io.Writer) (skillStatusOptions, error) {
-	var opts skillStatusOptions
+func parseSkillStatusArgs(args []string, stdout io.Writer) error {
 	flags := flag.NewFlagSet("pin skill status", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
-	flags.Var(&opts.targets, "target", "")
 	flags.Usage = func() { printSkillCommandUsage(stdout, "status") }
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
-			return opts, errHelp
+			return errHelp
 		}
-		return opts, err
+		return err
 	}
 	if flags.NArg() != 0 {
-		return opts, fmt.Errorf("skill status takes no positional arguments")
+		return fmt.Errorf("skill status takes no positional arguments")
 	}
-	return opts, nil
+	return nil
 }
 
-func mutationSkillTargets(env skillEnvironment, requested []string) ([]string, bool, error) {
-	if len(requested) > 0 {
-		targets, err := normalizeSkillTargets(requested)
-		if err != nil {
-			return nil, false, err
-		}
-		if containsString(targets, skillTargetRelay) && env.relay == nil {
-			return nil, false, fmt.Errorf("Relay is not configured; run relay init or choose a direct target")
-		}
-		return targets, false, nil
-	}
-	if env.relay != nil {
-		return []string{skillTargetRelay}, true, nil
-	}
-	var targets []string
-	for _, name := range []string{skillTargetCodex, skillTargetClaude, skillTargetCursor} {
-		if env.direct[name].detected {
-			targets = append(targets, name)
-		}
-	}
-	if len(targets) == 0 {
-		return nil, false, fmt.Errorf("no supported agents detected; pass --target relay, codex, claude, or cursor")
-	}
-	return targets, true, nil
-}
-
-func statusSkillTargets(requested []string) ([]string, error) {
-	if len(requested) > 0 {
-		return normalizeSkillTargets(requested)
-	}
-	return []string{skillTargetRelay, skillTargetCodex, skillTargetClaude, skillTargetCursor}, nil
-}
-
-func normalizeSkillTargets(values []string) ([]string, error) {
-	seen := make(map[string]bool)
-	var targets []string
-	for _, value := range values {
-		name := strings.ToLower(strings.TrimSpace(value))
-		if name == "claude-code" {
-			name = skillTargetClaude
-		}
-		switch name {
-		case skillTargetRelay, skillTargetCodex, skillTargetClaude, skillTargetCursor:
-		default:
-			return nil, fmt.Errorf("unknown skill target %q; expected relay, codex, claude, or cursor", value)
-		}
-		if !seen[name] {
-			seen[name] = true
-			targets = append(targets, name)
-		}
-	}
-	return targets, nil
-}
-
-func (a app) confirmSkillMutation(action string, targets []string, env skillEnvironment) (bool, error) {
-	if len(targets) == 1 && targets[0] == skillTargetRelay {
-		fmt.Fprintf(a.stdout, "Detected Relay at %s. Relay will be the only default installation target.\n", env.relay.configPath)
-		fmt.Fprintf(a.stdout, "%s the PIN skill through Relay? [Y/n] ", action)
-	} else {
-		labels := make([]string, 0, len(targets))
-		for _, name := range targets {
-			labels = append(labels, env.direct[name].label)
-		}
-		fmt.Fprintf(a.stdout, "Detected: %s.\n", strings.Join(labels, ", "))
-		fmt.Fprintf(a.stdout, "%s the PIN skill for all detected agents? [Y/n] ", action)
-	}
+func (a app) confirmSkillMutation(prompt string, defaultYes bool) (bool, error) {
+	fmt.Fprint(a.stdout, prompt)
 	reader := bufio.NewReader(a.stdin)
 	answer, err := reader.ReadString('\n')
 	answer = strings.ToLower(strings.TrimSpace(answer))
 	if err != nil && !(errors.Is(err, io.EOF) && answer != "") {
 		if errors.Is(err, io.EOF) {
-			return false, fmt.Errorf("confirmation required; rerun with --yes or an explicit --target")
+			return false, fmt.Errorf("confirmation required; rerun with --yes")
 		}
 		return false, err
 	}
+	if answer == "" {
+		return defaultYes, nil
+	}
 	switch answer {
-	case "", "y", "yes":
+	case "y", "yes":
 		return true, nil
 	case "n", "no":
 		return false, nil
@@ -378,7 +372,41 @@ func (a app) confirmSkillMutation(action string, targets []string, env skillEnvi
 	}
 }
 
+func detectSkillEnvironment() (skillEnvironment, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return skillEnvironment{}, fmt.Errorf("resolve home directory: %w", err)
+	}
+	canonicalPath := filepath.Join(home, ".agents", "skills", pinSkillName)
+	claudeConfigSet := strings.TrimSpace(os.Getenv("CLAUDE_CONFIG_DIR")) != ""
+	claudeHome := toolHome(home, "CLAUDE_CONFIG_DIR", ".claude")
+	claudePath := filepath.Join(claudeHome, "skills", pinSkillName)
+	return skillEnvironment{
+		canonical: skillTarget{path: canonicalPath, detected: true},
+		claude: skillTarget{
+			path:     claudePath,
+			detected: claudeConfigSet || pathExists(claudeHome) || pathExists(claudePath) || executableExists("claude"),
+		},
+	}, nil
+}
+
+func toolHome(home, envName, suffix string) string {
+	if value := strings.TrimSpace(os.Getenv(envName)); value != "" {
+		return expandSkillPath(value, home)
+	}
+	return filepath.Join(home, suffix)
+}
+
+func executableExists(name string) bool {
+	_, err := exec.LookPath(name)
+	return err == nil
+}
+
 func installSkillAt(path string, force bool) (bool, error) {
+	return installSkillAtWithRename(path, force, os.Rename)
+}
+
+func installSkillAtWithRename(path string, force bool, rename func(string, string) error) (bool, error) {
 	state, err := inspectSkillAt(path)
 	if err != nil {
 		return false, err
@@ -400,7 +428,12 @@ func installSkillAt(path string, force bool) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	defer os.RemoveAll(tempRoot)
+	cleanupTemp := true
+	defer func() {
+		if cleanupTemp {
+			_ = os.RemoveAll(tempRoot)
+		}
+	}()
 	candidate := filepath.Join(tempRoot, pinSkillName)
 	if err := writeBundledSkill(candidate); err != nil {
 		return false, err
@@ -408,15 +441,23 @@ func installSkillAt(path string, force bool) (bool, error) {
 
 	backup := filepath.Join(tempRoot, "previous")
 	if state != skillMissing {
-		if err := os.Rename(path, backup); err != nil {
+		if err := rename(path, backup); err != nil {
 			return false, err
 		}
 	}
-	if err := os.Rename(candidate, path); err != nil {
+	if err := rename(candidate, path); err != nil {
 		if state != skillMissing {
-			_ = os.Rename(backup, path)
+			if restoreErr := rename(backup, path); restoreErr != nil {
+				cleanupTemp = false
+				return false, fmt.Errorf(
+					"publish skill: %w; restore previous skill: %v; previous skill preserved at %s",
+					err,
+					restoreErr,
+					backup,
+				)
+			}
 		}
-		return false, err
+		return false, fmt.Errorf("publish skill: %w", err)
 	}
 	return true, nil
 }
@@ -485,17 +526,40 @@ func inspectSkillAt(path string) (skillInstallState, error) {
 		return "", err
 	}
 	var marker skillMarker
-	if err := json.Unmarshal(markerData, &marker); err != nil || marker.Schema != skillMarkerSchema || marker.Skill != pinSkillName || marker.Digest == "" {
+	if err := json.Unmarshal(markerData, &marker); err != nil || marker.Skill != pinSkillName || marker.Digest == "" {
 		return skillUnmanaged, nil
 	}
-	currentDigest := skillDigest(skillData)
-	if currentDigest == skillDigest(embeddedPinSkill) {
-		return skillCurrent, nil
+	switch marker.Schema {
+	case legacySkillMarkerSchema:
+		onlyLegacyContents, err := hasOnlyLegacyManagedContents(path)
+		if err != nil {
+			return "", err
+		}
+		if !onlyLegacyContents {
+			return skillModified, nil
+		}
+		if skillDigest(skillData) == marker.Digest {
+			return skillOutdated, nil
+		}
+		return skillModified, nil
+	case skillMarkerSchema:
+		currentDigest, err := skillPackageDigest(path)
+		if errors.Is(err, errUnsupportedSkillEntry) {
+			return skillModified, nil
+		}
+		if err != nil {
+			return "", err
+		}
+		if currentDigest == bundledSkillDigest() {
+			return skillCurrent, nil
+		}
+		if currentDigest == marker.Digest {
+			return skillOutdated, nil
+		}
+		return skillModified, nil
+	default:
+		return skillUnmanaged, nil
 	}
-	if currentDigest == marker.Digest {
-		return skillOutdated, nil
-	}
-	return skillModified, nil
 }
 
 func writeBundledSkill(path string) error {
@@ -505,7 +569,7 @@ func writeBundledSkill(path string) error {
 	if err := os.WriteFile(filepath.Join(path, "SKILL.md"), embeddedPinSkill, 0o644); err != nil {
 		return err
 	}
-	marker := skillMarker{Schema: skillMarkerSchema, Skill: pinSkillName, Digest: skillDigest(embeddedPinSkill)}
+	marker := skillMarker{Schema: skillMarkerSchema, Skill: pinSkillName, Digest: bundledSkillDigest()}
 	data, err := json.MarshalIndent(marker, "", "  ")
 	if err != nil {
 		return err
@@ -519,293 +583,81 @@ func skillDigest(data []byte) string {
 	return hex.EncodeToString(digest[:])
 }
 
-func (a app) installRelaySkill(relay *relaySkillConfig, force bool) error {
-	if relay == nil {
-		return fmt.Errorf("Relay is not configured")
-	}
-	if relay.relayExecutable == "" {
-		return fmt.Errorf("Relay is configured at %s but the relay executable is not in PATH", relay.configPath)
-	}
-	lock, err := acquireRelaySkillLock(relay.lockPath)
-	if err != nil {
-		return fmt.Errorf("acquire Relay process lock: %w", err)
-	}
-	path := filepath.Join(relay.centralSkillDir, pinSkillName)
-	changed, installErr := installSkillAt(path, force)
-	lock.release()
-	if installErr != nil {
-		return fmt.Errorf("install Relay skill source: %w", installErr)
-	}
+var errUnsupportedSkillEntry = errors.New("unsupported skill package entry")
 
-	command := exec.Command(relay.relayExecutable, "sync")
-	command.Stdout = a.stdout
-	command.Stderr = a.stderr
-	if err := command.Run(); err != nil {
-		return fmt.Errorf("installed skill source at %s but Relay sync failed: %w", path, err)
-	}
-	verb := "unchanged"
-	if changed {
-		verb = "installed"
-	}
-	fmt.Fprintf(a.stdout, "%s: relay %s\n", verb, path)
-	return nil
+func bundledSkillDigest() string {
+	hasher := sha256.New()
+	writeSkillDigestEntry(hasher, "file", "SKILL.md", embeddedPinSkill)
+	return hex.EncodeToString(hasher.Sum(nil))
 }
 
-func removeRelaySkill(relay *relaySkillConfig, force bool) (bool, error) {
-	if relay == nil {
-		return false, fmt.Errorf("Relay is not configured")
-	}
-	lock, err := acquireRelaySkillLock(relay.lockPath)
-	if err != nil {
-		return false, fmt.Errorf("acquire Relay process lock: %w", err)
-	}
-	defer lock.release()
-
-	paths := relay.managedSkillPaths()
-	removed := false
-	for _, path := range paths {
-		state, err := inspectSkillAt(path)
+func skillPackageDigest(root string) (string, error) {
+	hasher := sha256.New()
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		relative, err := filepath.Rel(root, path)
 		if err != nil {
-			return false, err
+			return err
 		}
-		if state == skillMissing {
-			continue
+		if relative == "." || relative == skillMarkerName {
+			return nil
 		}
-		if (state == skillModified || state == skillUnmanaged) && !force {
-			return false, fmt.Errorf("Relay-managed skill at %s is %s; inspect it or rerun with --force", path, state)
+		relative = filepath.ToSlash(relative)
+		if entry.IsDir() {
+			writeSkillDigestEntry(hasher, "dir", relative, nil)
+			return nil
 		}
-	}
-	for _, path := range paths {
-		state, err := inspectSkillAt(path)
+		if !entry.Type().IsRegular() {
+			return fmt.Errorf("%w: %s", errUnsupportedSkillEntry, relative)
+		}
+		data, err := os.ReadFile(path)
 		if err != nil {
-			return false, err
+			return err
 		}
-		if state == skillMissing {
-			continue
-		}
-		if err := removeSkillPath(path); err != nil {
-			return false, err
-		}
-		removed = true
-	}
-	return removed, nil
-}
-
-func (relay *relaySkillConfig) managedSkillPaths() []string {
-	seen := make(map[string]bool)
-	var paths []string
-	add := func(base string) {
-		if base == "" {
-			return
-		}
-		path := filepath.Join(base, pinSkillName)
-		if !seen[path] {
-			seen[path] = true
-			paths = append(paths, path)
-		}
-	}
-	add(relay.centralSkillDir)
-	for _, tool := range relay.enabledSkillTools() {
-		add(relay.targetSkillDirs[tool])
-	}
-	return paths
-}
-
-func (relay *relaySkillConfig) enabledSkillTools() []string {
-	var tools []string
-	for _, tool := range []string{skillTargetClaude, skillTargetCodex, skillTargetCursor, skillTargetOpenCode} {
-		if relay.enabledTools[tool] && relay.targetSkillDirs[tool] != "" {
-			tools = append(tools, tool)
-		}
-	}
-	return tools
-}
-
-func detectSkillEnvironment() (skillEnvironment, error) {
-	home, err := os.UserHomeDir()
+		writeSkillDigestEntry(hasher, "file", relative, data)
+		return nil
+	})
 	if err != nil {
-		return skillEnvironment{}, fmt.Errorf("resolve home directory: %w", err)
+		return "", err
 	}
-	relay, err := detectRelaySkillConfig(home)
-	if err != nil {
-		return skillEnvironment{}, err
-	}
-	codexHome := toolHome(home, "CODEX_HOME", ".codex")
-	claudeHome := toolHome(home, "CLAUDE_HOME", ".claude")
-	cursorHome := toolHome(home, "CURSOR_HOME", ".cursor")
-	codexSkills := filepath.Join(home, ".agents", "skills")
-	if value := strings.TrimSpace(os.Getenv("CODEX_HOME")); value != "" {
-		codexSkills = filepath.Join(expandSkillPath(value, home), "skills")
-	}
-	codexSkillPath := filepath.Join(codexSkills, pinSkillName)
-	claudeSkillPath := filepath.Join(claudeHome, "skills", pinSkillName)
-	cursorSkillPath := filepath.Join(cursorHome, "skills", pinSkillName)
-	direct := map[string]skillTarget{
-		skillTargetCodex: {
-			label:    "Codex",
-			path:     codexSkillPath,
-			detected: pathExists(codexHome) || pathExists(codexSkillPath) || executableExists("codex"),
-		},
-		skillTargetClaude: {
-			label:    "Claude Code",
-			path:     claudeSkillPath,
-			detected: pathExists(claudeHome) || pathExists(claudeSkillPath) || executableExists("claude"),
-		},
-		skillTargetCursor: {
-			label:    "Cursor",
-			path:     cursorSkillPath,
-			detected: pathExists(cursorHome) || pathExists(cursorSkillPath) || executableExists("cursor"),
-		},
-	}
-	return skillEnvironment{relay: relay, direct: direct}, nil
+	return hex.EncodeToString(hasher.Sum(nil)), nil
 }
 
-func toolHome(home, envName, suffix string) string {
-	if value := strings.TrimSpace(os.Getenv(envName)); value != "" {
-		return expandSkillPath(value, home)
-	}
-	return filepath.Join(home, suffix)
+func writeSkillDigestEntry(hasher hash.Hash, kind, path string, data []byte) {
+	fmt.Fprintf(hasher, "%s\x00%d\x00%s\x00%d\x00", kind, len(path), path, len(data))
+	_, _ = hasher.Write(data)
+	_, _ = hasher.Write([]byte{0})
 }
 
-func executableExists(name string) bool {
-	_, err := exec.LookPath(name)
-	return err == nil
-}
-
-func containsString(values []string, wanted string) bool {
-	for _, value := range values {
-		if value == wanted {
-			return true
+func hasOnlyLegacyManagedContents(root string) (bool, error) {
+	seenSkill := false
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
 		}
-	}
-	return false
-}
-
-type relayConfigFile struct {
-	EnabledTools      []string `toml:"enabled_tools"`
-	CentralSkillsDir  string   `toml:"central_skills_dir"`
-	ClaudeSkillsDir   string   `toml:"claude_skills_dir"`
-	CodexSkillsDir    string   `toml:"codex_skills_dir"`
-	CursorSkillsDir   string   `toml:"cursor_skills_dir"`
-	OpencodeSkillsDir string   `toml:"opencode_skills_dir"`
-}
-
-func detectRelaySkillConfig(home string) (*relaySkillConfig, error) {
-	configPath := relayConfigPath(home)
-	if configPath == "" {
-		return nil, nil
-	}
-	if _, err := os.Stat(configPath); errors.Is(err, os.ErrNotExist) {
-		return nil, nil
-	} else if err != nil {
-		return nil, err
-	}
-
-	defaults := relayConfigFile{
-		EnabledTools:      []string{skillTargetClaude, skillTargetCodex, skillTargetCursor, skillTargetOpenCode},
-		CentralSkillsDir:  filepath.Join(filepath.Dir(configPath), "skills"),
-		ClaudeSkillsDir:   filepath.Join(toolHome(home, "CLAUDE_HOME", ".claude"), "skills"),
-		CodexSkillsDir:    filepath.Join(toolHome(home, "CODEX_HOME", ".codex"), "skills"),
-		OpencodeSkillsDir: filepath.Join(toolHome(home, "OPENCODE_HOME", ".config/opencode"), "skill"),
-	}
-	var raw relayConfigFile
-	metadata, err := toml.DecodeFile(configPath, &raw)
-	if err != nil {
-		return nil, fmt.Errorf("read Relay config %s: %w", configPath, err)
-	}
-	if metadata.IsDefined("enabled_tools") {
-		defaults.EnabledTools = raw.EnabledTools
-	}
-	pathFields := []struct {
-		name        string
-		destination *string
-		source      string
-	}{
-		{"central_skills_dir", &defaults.CentralSkillsDir, raw.CentralSkillsDir},
-		{"claude_skills_dir", &defaults.ClaudeSkillsDir, raw.ClaudeSkillsDir},
-		{"codex_skills_dir", &defaults.CodexSkillsDir, raw.CodexSkillsDir},
-		{"cursor_skills_dir", &defaults.CursorSkillsDir, raw.CursorSkillsDir},
-		{"opencode_skills_dir", &defaults.OpencodeSkillsDir, raw.OpencodeSkillsDir},
-	}
-	for _, field := range pathFields {
-		source := field.source
-		if strings.TrimSpace(source) != "" {
-			*field.destination = source
-		}
-		expanded, err := expandRelayConfigPath(*field.destination, home)
+		relative, err := filepath.Rel(root, path)
 		if err != nil {
-			return nil, fmt.Errorf("invalid %s in Relay config: %w", field.name, err)
+			return err
 		}
-		*field.destination = expanded
-	}
-
-	enabled := make(map[string]bool)
-	for _, tool := range defaults.EnabledTools {
-		enabled[strings.ToLower(tool)] = true
-	}
-	relayExecutable, _ := exec.LookPath("relay")
-	return &relaySkillConfig{
-		configPath:      configPath,
-		lockPath:        filepath.Join(filepath.Dir(configPath), "runtime", "relay.lock"),
-		centralSkillDir: defaults.CentralSkillsDir,
-		targetSkillDirs: map[string]string{
-			skillTargetClaude:   defaults.ClaudeSkillsDir,
-			skillTargetCodex:    defaults.CodexSkillsDir,
-			skillTargetCursor:   defaults.CursorSkillsDir,
-			skillTargetOpenCode: defaults.OpencodeSkillsDir,
-		},
-		enabledTools:    enabled,
-		relayExecutable: relayExecutable,
-	}, nil
-}
-
-func relayConfigPath(home string) string {
-	if value := strings.TrimSpace(os.Getenv("RELAY_HOME")); value != "" {
-		relayHome := expandSkillPath(value, home)
-		return filepath.Join(relayHome, ".config", "relay", "config.toml")
-	}
-	xdg := strings.TrimSpace(os.Getenv("XDG_CONFIG_HOME"))
-	if xdg == "" {
-		xdg = filepath.Join(home, ".config")
-	} else {
-		xdg = expandSkillPath(xdg, home)
-	}
-	primary := filepath.Join(xdg, "relay", "config.toml")
-	if pathExists(primary) {
-		return primary
-	}
-	if configRoot, err := os.UserConfigDir(); err == nil {
-		legacy := filepath.Join(configRoot, "relay", "config.toml")
-		if legacy != primary && pathExists(legacy) {
-			return legacy
+		switch relative {
+		case ".", skillMarkerName:
+			return nil
+		case "SKILL.md":
+			if !entry.Type().IsRegular() {
+				return errUnsupportedSkillEntry
+			}
+			seenSkill = true
+			return nil
+		default:
+			return errUnsupportedSkillEntry
 		}
+	})
+	if errors.Is(err, errUnsupportedSkillEntry) {
+		return false, nil
 	}
-	return primary
-}
-
-func expandRelayConfigPath(value, home string) (string, error) {
-	if strings.TrimSpace(value) == "" {
-		return "", nil
-	}
-	xdg := strings.TrimSpace(os.Getenv("XDG_CONFIG_HOME"))
-	if xdg == "" {
-		xdg = filepath.Join(home, ".config")
-	} else {
-		xdg = expandSkillPath(xdg, home)
-	}
-	replacer := strings.NewReplacer(
-		"${XDG_CONFIG_HOME:-$HOME/.config}", xdg,
-		"${XDG_CONFIG_HOME:-${HOME}/.config}", xdg,
-		"${XDG_CONFIG_HOME}", xdg,
-		"$XDG_CONFIG_HOME", xdg,
-		"${HOME}", home,
-		"$HOME", home,
-	)
-	expanded := replacer.Replace(strings.TrimSpace(value))
-	if strings.ContainsAny(expanded, "$`") {
-		return "", fmt.Errorf("unsupported shell syntax in %q", value)
-	}
-	return expandSkillPath(expanded, home), nil
+	return seenSkill, err
 }
 
 func expandSkillPath(value, home string) string {

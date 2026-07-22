@@ -77,11 +77,11 @@ func (a app) run(args []string) error {
 	case "status":
 		return a.commandWithOptionalContext(command, commandArgs, opts, a.commandStatus)
 	case "verify":
-		return a.commandWithOptionalContext(command, commandArgs, opts, a.commandVerify)
+		return a.commandVerifyArgs(commandArgs, opts)
 	case "check":
-		return a.commandWithSourceContext(command, commandArgs, opts, a.commandCheck)
+		return a.commandCheckArgs(commandArgs, opts)
 	case "update":
-		return a.commandWithSourceContext(command, commandArgs, opts, a.commandUpdate)
+		return a.commandUpdateArgs(commandArgs, opts)
 	case "rollback":
 		return a.commandWithOptionalContext(command, commandArgs, opts, a.commandRollback)
 	case "run":
@@ -184,9 +184,9 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  init [path]")
 	fmt.Fprintln(w, "  skill <install|remove|status>")
 	fmt.Fprintln(w, "  status [tool_or_path]")
-	fmt.Fprintln(w, "  verify [tool_or_path]")
-	fmt.Fprintln(w, "  check [tool_or_path]")
-	fmt.Fprintln(w, "  update [tool_or_path]")
+	fmt.Fprintln(w, "  verify [tool_or_path | --all]")
+	fmt.Fprintln(w, "  check [tool_or_path | --all]")
+	fmt.Fprintln(w, "  update [tool_or_path | --all [--yes]]")
 	fmt.Fprintln(w, "  rollback [tool_or_path]")
 	fmt.Fprintln(w, "  run tool [-- args...]")
 	fmt.Fprintln(w, "  list")
@@ -199,7 +199,11 @@ func printCommandUsage(w io.Writer, command string) {
 		fmt.Fprintln(w, "Usage: pin init [--name NAME] [--source PATH] [--entrypoint NAME] [--requirements PATH] [--inject PATH] [--branch BRANCH] [--remote REMOTE] [--preflight COMMAND] [--verify COMMAND] [path]")
 	case "skill":
 		printSkillUsage(w)
-	case "status", "verify", "check", "update", "rollback":
+	case "verify", "check":
+		fmt.Fprintf(w, "Usage: pin %s [tool_or_path | --all]\n", command)
+	case "update":
+		fmt.Fprintln(w, "Usage: pin update [tool_or_path | --all [--yes]]")
+	case "status", "rollback":
 		fmt.Fprintf(w, "Usage: pin %s [tool_or_path]\n", command)
 	case "run":
 		fmt.Fprintln(w, "Usage: pin run tool [-- args...]")
@@ -464,66 +468,18 @@ func (a app) commandRun(ctx pinContext, args []string) error {
 }
 
 func (a app) commandList(opts globalOptions) error {
-	seen := map[string]bool{}
-	if err := a.writeCurrentList(opts, seen); err != nil {
-		return err
-	}
-	if opts.legacyPinHome == "" {
-		return nil
-	}
-	return a.writeLegacyList(opts.legacyPinHome, seen)
-}
-
-func (a app) writeCurrentList(opts globalOptions, seen map[string]bool) error {
-	entries, err := os.ReadDir(opts.pinHome)
+	names, err := installedToolNames(opts)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
 		return err
 	}
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		if seen[entry.Name()] {
-			continue
-		}
-		ctx := pinContext{name: entry.Name(), pinHome: opts.pinHome}
-		metadata, err := readCurrentMetadata(ctx)
+	for _, name := range names {
+		ctx, metadata, err := resolveToolInstall(name, opts)
 		if err != nil {
-			if _, ok, legacyErr := legacyContext(entry.Name(), opts); legacyErr == nil && ok {
-				continue
-			}
 			return err
 		}
 		if metadata == nil {
 			continue
 		}
-		seen[entry.Name()] = true
-		fmt.Fprintf(a.stdout, "%s\t%s\t%s\t%s\n", ctx.name, metadata.string("git_sha"), ctx.toolRoot(), ctx.currentLink())
-	}
-	return nil
-}
-
-func (a app) writeLegacyList(pinHome string, seen map[string]bool) error {
-	entries, err := os.ReadDir(pinHome)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		return err
-	}
-	for _, entry := range entries {
-		if !entry.IsDir() || seen[entry.Name()] {
-			continue
-		}
-		ctx := pinContext{name: entry.Name(), pinHome: pinHome}
-		metadata, ok, err := legacyMetadata(ctx)
-		if err != nil || !ok {
-			continue
-		}
-		seen[entry.Name()] = true
 		fmt.Fprintf(a.stdout, "%s\t%s\t%s\t%s\n", ctx.name, metadata.string("git_sha"), ctx.toolRoot(), ctx.currentLink())
 	}
 	return nil

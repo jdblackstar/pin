@@ -23,20 +23,19 @@ initialize, update, verify, run, and roll back PIN-managed tools:
 pin skill install
 ```
 
-PIN detects Codex, Claude Code, and Cursor, shows the destinations it found,
-and asks before writing to them. If PIN detects an initialized Relay config,
-Relay becomes the only default destination and distributes the skill to the
-skill-capable tools enabled in Relay. Use explicit targets to override
-detection:
+PIN always installs the canonical skill at `~/.agents/skills/pin`, which is
+shared by compatible coding agents. When an installed Relay advertises scoped
+skill synchronization, PIN quietly asks it to reconcile only this skill with
+configured compatibility locations. PIN never runs a broad Relay sync and does
+not require or start `relay watch`.
 
-```bash
-pin skill install --target codex
-pin skill install --target claude --target cursor
-```
+Relay is optional. Without compatible scoped synchronization, PIN installs a
+standard Claude Code compatibility copy when Claude Code is detected. Missing,
+older, or incompatible Relay versions do not prevent the canonical skill from
+being installed.
 
-Direct installs use the agents' global skill directories. PIN records a digest
-next to the installed skill so upgrades are idempotent and locally modified or
-unmanaged skills are not replaced without `--force`.
+PIN records a digest next to each copy it writes so upgrades are idempotent and
+locally modified or unmanaged skills are not replaced without `--force`.
 
 Inspect or remove the installed skill with:
 
@@ -261,13 +260,13 @@ runtime files added alongside the repo contents:
 
 ```bash
 pin init [path]
-pin skill install [--target TARGET] [--yes] [--force]
-pin skill remove [--target TARGET] [--yes] [--force]
-pin skill status [--target TARGET]
+pin skill install [--yes] [--force]
+pin skill remove [--yes] [--force]
+pin skill status
 pin status [tool_or_path]
-pin check [tool_or_path]
-pin update [tool_or_path]
-pin verify [tool_or_path]
+pin check [tool_or_path | --all]
+pin update [tool_or_path | --all [--yes]]
+pin verify [tool_or_path | --all]
 pin rollback [tool_or_path]
 pin run tool [-- args...]
 pin list
@@ -278,6 +277,15 @@ pin version
 `tool_or_path` can be either a repo path containing `pin.toml` or an installed
 tool name. Commands that need source state, such as `update` and `check`, need
 the config from the repo path or from release metadata.
+
+Use `--all` with `verify`, `check`, or `update` to operate on every installed
+tool. `verify --all` validates every active release and runs its configured
+verification commands. `check --all` compares every active release with its
+configured source branch. `update --all` checks first, shows the non-current
+tools, and prompts once before updating them; pass `--yes` to skip the prompt in
+automation. All three commands continue after per-tool failures, print a
+summary, and exit nonzero if any tool fails. `--all` cannot be combined with a
+tool name or path.
 
 By default, new installs live under `~/.local/share/pin/<tool>`. Existing
 installs from older versions under `~/.local/share/<tool>` remain supported and

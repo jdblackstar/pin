@@ -2,9 +2,13 @@ package app
 
 import (
 	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -12,17 +16,115 @@ import (
 
 func runSkillCLI(t *testing.T, home, input string, args ...string) cliResult {
 	t.Helper()
+	return runSkillCLIWithPath(t, home, "/usr/bin:/bin", input, args...)
+}
+
+func runSkillCLIWithPath(t *testing.T, home, path, input string, args ...string) cliResult {
+	t.Helper()
+	return runSkillCLIWithPathAndClaudeConfig(t, home, path, "", input, args...)
+}
+
+func runSkillCLIWithPathAndClaudeConfig(t *testing.T, home, path, claudeConfig, input string, args ...string) cliResult {
+	t.Helper()
 	t.Setenv("HOME", home)
 	t.Setenv("XDG_CONFIG_HOME", "")
 	t.Setenv("RELAY_HOME", "")
 	t.Setenv("CODEX_HOME", "")
-	t.Setenv("CLAUDE_HOME", "")
+	t.Setenv("CLAUDE_CONFIG_DIR", claudeConfig)
 	t.Setenv("CURSOR_HOME", "")
 	t.Setenv("OPENCODE_HOME", "")
-	t.Setenv("PATH", "/usr/bin:/bin")
+	t.Setenv("PATH", path)
 	var stdout, stderr bytes.Buffer
 	code := runCLI(args, strings.NewReader(input), &stdout, &stderr)
 	return cliResult{code: code, stdout: stdout.String(), stderr: stderr.String()}
+}
+
+func installFakeRelay(t *testing.T, home, mode string) (string, string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("fake Relay executable uses a POSIX shell")
+	}
+	binDir := filepath.Join(home, "bin")
+	relayPath := filepath.Join(binDir, "relay")
+	logPath := filepath.Join(home, "relay-argv.log")
+	script := `#!/bin/sh
+	printf '%s' "$#" >> "$RELAY_TEST_LOG"
+	for arg in "$@"; do
+	  printf '\t%s' "$arg" >> "$RELAY_TEST_LOG"
+	done
+	printf '\n' >> "$RELAY_TEST_LOG"
+if [ "$1" = "capabilities" ] && [ "$2" = "--json" ]; then
+  case "$RELAY_TEST_MODE" in
+    supported|sync-fail)
+      printf '%s\n' '{"schema_version":1,"capabilities":{"skills.sync.scoped":1}}'
+      exit 0
+      ;;
+    old)
+      printf '%s\n' 'error: unrecognized subcommand capabilities' >&2
+      exit 2
+      ;;
+    malformed)
+      printf '%s\n' '{not-json'
+      exit 0
+      ;;
+    absent)
+      printf '%s\n' '{"schema_version":1,"capabilities":{}}'
+      exit 0
+      ;;
+    unknown-schema)
+      printf '%s\n' '{"schema_version":2,"capabilities":{"skills.sync.scoped":1}}'
+      exit 0
+      ;;
+  esac
+fi
+if [ "$1" = "sync" ] && [ "$2" = "skill" ]; then
+  if [ "$RELAY_TEST_MODE" = "sync-fail" ]; then
+    printf '%s\n' 'scoped sync failed' >&2
+    exit 9
+  fi
+  exit 0
+fi
+printf '%s\n' 'unexpected fake Relay invocation' >&2
+exit 64
+`
+	writeFile(t, relayPath, script)
+	if err := os.Chmod(relayPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("RELAY_TEST_LOG", logPath)
+	t.Setenv("RELAY_TEST_MODE", mode)
+	return binDir + ":/usr/bin:/bin", logPath
+}
+
+func relayInvocations(t *testing.T, logPath string) [][]string {
+	t.Helper()
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.FieldsFunc(string(data), func(r rune) bool { return r == '\n' })
+	invocations := make([][]string, 0, len(lines))
+	for _, line := range lines {
+		fields := strings.Split(line, "\t")
+		if len(fields) == 0 {
+			t.Fatalf("empty Relay invocation log line")
+		}
+		wantCount := len(fields) - 1
+		if fields[0] != fmt.Sprintf("%d", wantCount) {
+			t.Fatalf("Relay invocation count = %q, args=%#v", fields[0], fields[1:])
+		}
+		invocations = append(invocations, fields[1:])
+	}
+	return invocations
+}
+
+func assertNoBroadRelaySync(t *testing.T, invocations [][]string) {
+	t.Helper()
+	for _, invocation := range invocations {
+		if len(invocation) > 0 && invocation[0] == "sync" && (len(invocation) < 2 || invocation[1] != "skill") {
+			t.Fatalf("broad Relay sync was invoked: %q", invocation)
+		}
+	}
 }
 
 func TestEmbeddedPinSkillHasPortableFrontmatter(t *testing.T) {
@@ -35,76 +137,307 @@ func TestEmbeddedPinSkillHasPortableFrontmatter(t *testing.T) {
 	}
 }
 
-func TestSkillDirectLifecycle(t *testing.T) {
+func TestSkillInstallAlwaysWritesCanonicalStore(t *testing.T) {
 	home := t.TempDir()
-	path := filepath.Join(home, ".agents", "skills", "pin")
+	canonical := filepath.Join(home, ".agents", "skills", "pin")
 
-	result := runSkillCLI(t, home, "", "skill", "install", "--target", "codex")
+	result := runSkillCLI(t, home, "", "skill", "install", "--yes")
 	if result.code != 0 {
 		t.Fatalf("install failed: %s", result.stderr)
 	}
-	requireContains(t, result.stdout, "installed: codex "+path)
-	requireContains(t, mustReadFile(t, filepath.Join(path, "SKILL.md")), "name: pin")
-	if _, err := os.Stat(filepath.Join(path, skillMarkerName)); err != nil {
+	requireContains(t, result.stdout, "installed skill: "+canonical)
+	requireContains(t, mustReadFile(t, filepath.Join(canonical, "SKILL.md")), "name: pin")
+	if _, err := os.Stat(filepath.Join(canonical, skillMarkerName)); err != nil {
 		t.Fatalf("managed marker missing: %v", err)
 	}
-
-	result = runSkillCLI(t, home, "", "skill", "status", "--target", "codex")
-	if result.code != 0 {
-		t.Fatalf("status failed: %s", result.stderr)
-	}
-	requireContains(t, result.stdout, "codex: current detected=yes path="+path)
-
-	result = runSkillCLI(t, home, "", "skill", "install", "--target", "codex")
-	if result.code != 0 {
-		t.Fatalf("repeat install failed: %s", result.stderr)
-	}
-	requireContains(t, result.stdout, "unchanged: codex "+path)
-
-	appendFile(t, filepath.Join(path, "SKILL.md"), "\nlocal edit\n")
-	result = runSkillCLI(t, home, "", "skill", "status", "--target", "codex")
-	requireContains(t, result.stdout, "codex: modified")
-
-	result = runSkillCLI(t, home, "", "skill", "remove", "--target", "codex")
-	if result.code == 0 {
-		t.Fatal("remove unexpectedly replaced a locally modified skill")
-	}
-	requireContains(t, result.stderr, "skill is modified")
-
-	result = runSkillCLI(t, home, "", "skill", "remove", "--target", "codex", "--force")
-	if result.code != 0 {
-		t.Fatalf("forced remove failed: %s", result.stderr)
-	}
-	requireContains(t, result.stdout, "removed: codex "+path)
-	if pathExists(path) {
-		t.Fatal("skill still exists after remove")
+	if pathExists(filepath.Join(home, ".claude", "skills", "pin")) {
+		t.Fatal("Claude compatibility copy installed without detecting Claude Code")
 	}
 }
 
-func TestSkillInstallProtectsUnmanagedSkill(t *testing.T) {
+func TestSkillInstallWithoutRelayUsesClaudeFallback(t *testing.T) {
 	home := t.TempDir()
-	path := filepath.Join(home, ".claude", "skills", "pin")
-	writeFile(t, filepath.Join(path, "SKILL.md"), "user skill\n")
-
-	result := runSkillCLI(t, home, "", "skill", "install", "--target", "claude")
-	if result.code == 0 {
-		t.Fatal("install unexpectedly replaced an unmanaged skill")
+	if err := os.MkdirAll(filepath.Join(home, ".claude"), 0o755); err != nil {
+		t.Fatal(err)
 	}
-	requireContains(t, result.stderr, "already exists and is unmanaged")
-	if got := mustReadFile(t, filepath.Join(path, "SKILL.md")); got != "user skill\n" {
+	canonical := filepath.Join(home, ".agents", "skills", "pin")
+	claude := filepath.Join(home, ".claude", "skills", "pin")
+
+	result := runSkillCLI(t, home, "", "skill", "install", "--yes")
+	if result.code != 0 {
+		t.Fatalf("install failed: %s", result.stderr)
+	}
+	for _, path := range []string{canonical, claude} {
+		if !pathExists(filepath.Join(path, "SKILL.md")) {
+			t.Fatalf("skill missing from %s", path)
+		}
+	}
+	requireContains(t, result.stdout, "installed compatibility copy: "+claude)
+	if result.stderr != "" {
+		t.Fatalf("unexpected warning without Relay: %s", result.stderr)
+	}
+}
+
+func TestSkillInstallOldRelayFallsBackWithoutFailing(t *testing.T) {
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, ".claude"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path, logPath := installFakeRelay(t, home, "old")
+
+	result := runSkillCLIWithPath(t, home, path, "", "skill", "install", "--yes")
+	if result.code != 0 {
+		t.Fatalf("old Relay should not block install: %s", result.stderr)
+	}
+	if !pathExists(filepath.Join(home, ".claude", "skills", "pin", "SKILL.md")) {
+		t.Fatal("standalone Claude fallback was not installed")
+	}
+	invocations := relayInvocations(t, logPath)
+	if !reflect.DeepEqual(invocations, [][]string{{"capabilities", "--json"}}) {
+		t.Fatalf("unexpected old Relay invocations: %#v", invocations)
+	}
+	assertNoBroadRelaySync(t, invocations)
+	if result.stderr != "" {
+		t.Fatalf("unsupported Relay should be a silent fallback: %s", result.stderr)
+	}
+}
+
+func TestSkillInstallUnsupportedRelayCapabilityFallsBack(t *testing.T) {
+	for _, mode := range []string{"malformed", "absent", "unknown-schema"} {
+		t.Run(mode, func(t *testing.T) {
+			home := t.TempDir()
+			if err := os.MkdirAll(filepath.Join(home, ".claude"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			path, logPath := installFakeRelay(t, home, mode)
+
+			result := runSkillCLIWithPath(t, home, path, "", "skill", "install", "--yes")
+			if result.code != 0 {
+				t.Fatalf("unsupported capability should not block install: %s", result.stderr)
+			}
+			if !pathExists(filepath.Join(home, ".claude", "skills", "pin", "SKILL.md")) {
+				t.Fatal("standalone Claude fallback was not installed")
+			}
+			invocations := relayInvocations(t, logPath)
+			if !reflect.DeepEqual(invocations, [][]string{{"capabilities", "--json"}}) {
+				t.Fatalf("unexpected Relay invocations: %#v", invocations)
+			}
+			assertNoBroadRelaySync(t, invocations)
+			if result.stderr != "" {
+				t.Fatalf("unsupported capability should be silent: %s", result.stderr)
+			}
+		})
+	}
+}
+
+func TestSkillInstallSupportedRelayUsesExactScopedArgv(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "home with spaces")
+	if err := os.MkdirAll(filepath.Join(home, ".claude"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path, logPath := installFakeRelay(t, home, "supported")
+	canonical := filepath.Join(home, ".agents", "skills", "pin")
+
+	result := runSkillCLIWithPath(t, home, path, "", "skill", "install", "--yes")
+	if result.code != 0 {
+		t.Fatalf("supported Relay install failed: %s", result.stderr)
+	}
+	invocations := relayInvocations(t, logPath)
+	want := [][]string{
+		{"capabilities", "--json"},
+		{"sync", "skill", "--quiet", "--fail-on-conflict", canonical},
+	}
+	if !reflect.DeepEqual(invocations, want) {
+		t.Fatalf("Relay argv = %#v, want %#v", invocations, want)
+	}
+	assertNoBroadRelaySync(t, invocations)
+	if pathExists(filepath.Join(home, ".claude", "skills", "pin")) {
+		t.Fatal("PIN wrote a direct Claude copy after successful scoped sync")
+	}
+	wantStdout := "installed skill: " + canonical + "\n"
+	if result.stdout != wantStdout || result.stderr != "" {
+		t.Fatalf("successful ambient integration was noisy: stdout=%q stderr=%q", result.stdout, result.stderr)
+	}
+}
+
+func TestSkillInstallScopedRelayFailureUsesFallback(t *testing.T) {
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, ".claude"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path, logPath := installFakeRelay(t, home, "sync-fail")
+	canonical := filepath.Join(home, ".agents", "skills", "pin")
+	claude := filepath.Join(home, ".claude", "skills", "pin")
+
+	result := runSkillCLIWithPath(t, home, path, "", "skill", "install", "--yes")
+	if result.code != 0 {
+		t.Fatalf("optional Relay failure blocked install: %s", result.stderr)
+	}
+	for _, skill := range []string{canonical, claude} {
+		if !pathExists(filepath.Join(skill, "SKILL.md")) {
+			t.Fatalf("skill missing from %s", skill)
+		}
+	}
+	requireContains(t, result.stderr, "Relay could not synchronize compatibility copies; used the standalone fallback")
+	invocations := relayInvocations(t, logPath)
+	want := [][]string{
+		{"capabilities", "--json"},
+		{"sync", "skill", "--quiet", "--fail-on-conflict", canonical},
+	}
+	if !reflect.DeepEqual(invocations, want) {
+		t.Fatalf("unexpected Relay invocations: %#v", invocations)
+	}
+	assertNoBroadRelaySync(t, invocations)
+}
+
+func TestSkillInstallProtectsUnmanagedClaudeFallback(t *testing.T) {
+	home := t.TempDir()
+	canonical := filepath.Join(home, ".agents", "skills", "pin")
+	claude := filepath.Join(home, ".claude", "skills", "pin")
+	writeFile(t, filepath.Join(claude, "SKILL.md"), "user skill\n")
+
+	result := runSkillCLI(t, home, "", "skill", "install", "--yes")
+	if result.code == 0 {
+		t.Fatal("install unexpectedly replaced an unmanaged Claude skill")
+	}
+	requireContains(t, result.stderr, "canonical skill remains installed")
+	if !pathExists(filepath.Join(canonical, "SKILL.md")) {
+		t.Fatal("canonical skill was lost when fallback failed")
+	}
+	if got := mustReadFile(t, filepath.Join(claude, "SKILL.md")); got != "user skill\n" {
 		t.Fatalf("unmanaged skill changed: %q", got)
 	}
+}
 
-	result = runSkillCLI(t, home, "", "skill", "install", "--target", "claude", "--force")
-	if result.code != 0 {
-		t.Fatalf("forced install failed: %s", result.stderr)
+func TestSkillLifecycleProtectsModifiedCopiesAndPreflightsRemoval(t *testing.T) {
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, ".claude"), 0o755); err != nil {
+		t.Fatal(err)
 	}
-	requireContains(t, mustReadFile(t, filepath.Join(path, "SKILL.md")), "name: pin")
+	canonical := filepath.Join(home, ".agents", "skills", "pin")
+	claude := filepath.Join(home, ".claude", "skills", "pin")
+	result := runSkillCLI(t, home, "", "skill", "install", "--yes")
+	if result.code != 0 {
+		t.Fatalf("install failed: %s", result.stderr)
+	}
+	appendFile(t, filepath.Join(claude, "SKILL.md"), "\nlocal edit\n")
+
+	result = runSkillCLI(t, home, "", "skill", "remove", "--yes")
+	if result.code == 0 {
+		t.Fatal("remove unexpectedly deleted a modified compatibility copy")
+	}
+	if !pathExists(canonical) || !pathExists(claude) {
+		t.Fatal("removal was not preflighted before deleting copies")
+	}
+	requireContains(t, result.stderr, "skill is modified")
+
+	result = runSkillCLI(t, home, "", "skill", "remove", "--yes", "--force")
+	if result.code != 0 {
+		t.Fatalf("forced remove failed: %s", result.stderr)
+	}
+	if pathExists(canonical) || pathExists(claude) {
+		t.Fatal("forced remove left a managed skill copy")
+	}
+}
+
+func TestSkillRemoveDoesNotInvokeRelay(t *testing.T) {
+	home := t.TempDir()
+	path, logPath := installFakeRelay(t, home, "supported")
+	result := runSkillCLIWithPath(t, home, path, "", "skill", "install", "--yes")
+	if result.code != 0 {
+		t.Fatalf("install failed: %s", result.stderr)
+	}
+	before := relayInvocations(t, logPath)
+
+	result = runSkillCLIWithPath(t, home, path, "", "skill", "remove", "--yes")
+	if result.code != 0 {
+		t.Fatalf("remove failed: %s", result.stderr)
+	}
+	after := relayInvocations(t, logPath)
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("remove invoked Relay: before=%#v after=%#v", before, after)
+	}
+}
+
+func TestSkillRemoveDefaultsToNo(t *testing.T) {
+	home := t.TempDir()
+	canonical := filepath.Join(home, ".agents", "skills", "pin")
+	result := runSkillCLI(t, home, "", "skill", "install", "--yes")
+	if result.code != 0 {
+		t.Fatalf("install failed: %s", result.stderr)
+	}
+
+	result = runSkillCLI(t, home, "\n", "skill", "remove")
+	if result.code != 0 {
+		t.Fatalf("cancel failed: %s", result.stderr)
+	}
+	requireContains(t, result.stdout, "[y/N]")
+	requireContains(t, result.stdout, "cancelled")
+	if !pathExists(canonical) {
+		t.Fatal("default removal confirmation deleted the skill")
+	}
+}
+
+func TestSkillInstallRequiresInteractiveConfirmation(t *testing.T) {
+	home := t.TempDir()
+	result := runSkillCLI(t, home, "", "skill", "install")
+	if result.code == 0 {
+		t.Fatal("install unexpectedly proceeded without confirmation")
+	}
+	requireContains(t, result.stderr, "confirmation required; rerun with --yes")
+	if pathExists(filepath.Join(home, ".agents", "skills", "pin")) {
+		t.Fatal("skill installed without confirmation")
+	}
+}
+
+func TestSkillInstallConfirmationIncludesPossibleClaudeCopy(t *testing.T) {
+	home := t.TempDir()
+	claudeConfig := filepath.Join(t.TempDir(), "claude config")
+	result := runSkillCLIWithPathAndClaudeConfig(t, home, "/usr/bin:/bin", claudeConfig, "n\n", "skill", "install")
+	if result.code != 0 {
+		t.Fatalf("cancel failed: %s", result.stderr)
+	}
+	requireContains(t, result.stdout, "Claude Code compatibility copy at "+filepath.Join(claudeConfig, "skills", "pin"))
+	if pathExists(filepath.Join(home, ".agents", "skills", "pin")) || pathExists(filepath.Join(claudeConfig, "skills", "pin")) {
+		t.Fatal("cancelled confirmation installed a skill")
+	}
+}
+
+func TestSkillInstallHonorsClaudeConfigDir(t *testing.T) {
+	home := t.TempDir()
+	claudeConfig := filepath.Join(t.TempDir(), "claude config")
+	result := runSkillCLIWithPathAndClaudeConfig(t, home, "/usr/bin:/bin", claudeConfig, "", "skill", "install", "--yes")
+	if result.code != 0 {
+		t.Fatalf("install failed: %s", result.stderr)
+	}
+	if !pathExists(filepath.Join(claudeConfig, "skills", "pin", "SKILL.md")) {
+		t.Fatal("compatibility copy did not use CLAUDE_CONFIG_DIR")
+	}
+	if pathExists(filepath.Join(home, ".claude", "skills", "pin")) {
+		t.Fatal("compatibility copy unexpectedly used the default Claude config directory")
+	}
+}
+
+func TestSkillStatusReportsCanonicalAndClaudeCompatibility(t *testing.T) {
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, ".claude"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	result := runSkillCLI(t, home, "", "skill", "install", "--yes")
+	if result.code != 0 {
+		t.Fatalf("install failed: %s", result.stderr)
+	}
+	result = runSkillCLI(t, home, "", "skill", "status")
+	if result.code != 0 {
+		t.Fatalf("status failed: %s", result.stderr)
+	}
+	requireContains(t, result.stdout, "pin: current path="+filepath.Join(home, ".agents", "skills", "pin"))
+	requireContains(t, result.stdout, "claude compatibility: current detected=yes path="+filepath.Join(home, ".claude", "skills", "pin"))
 }
 
 func TestSkillInstallUpdatesUnmodifiedManagedSkill(t *testing.T) {
 	home := t.TempDir()
-	path := filepath.Join(home, ".cursor", "skills", "pin")
+	path := filepath.Join(home, ".agents", "skills", "pin")
 	oldSkill := []byte("---\nname: pin\ndescription: old\n---\n\nOld instructions.\n")
 	writeFile(t, filepath.Join(path, "SKILL.md"), string(oldSkill))
 	marker := `{"schema":1,"skill":"pin","digest":"` + skillDigest(oldSkill) + `"}`
@@ -117,14 +450,205 @@ func TestSkillInstallUpdatesUnmodifiedManagedSkill(t *testing.T) {
 	if state != skillOutdated {
 		t.Fatalf("state = %s, want outdated", state)
 	}
-	result := runSkillCLI(t, home, "", "skill", "install", "--target", "cursor")
+	result := runSkillCLI(t, home, "", "skill", "install", "--yes")
 	if result.code != 0 {
 		t.Fatalf("managed update failed: %s", result.stderr)
 	}
-	requireContains(t, result.stdout, "installed: cursor "+path)
 	if state, err := inspectSkillAt(path); err != nil || state != skillCurrent {
 		t.Fatalf("state after update = %s, err=%v", state, err)
 	}
+}
+
+func TestSkillPackageIdentityProtectsAddedEntries(t *testing.T) {
+	tests := []struct {
+		name string
+		add  func(t *testing.T, path string)
+	}{
+		{
+			name: "extra file",
+			add: func(t *testing.T, path string) {
+				writeFile(t, filepath.Join(path, "notes.txt"), "local notes\n")
+			},
+		},
+		{
+			name: "nested content",
+			add: func(t *testing.T, path string) {
+				writeFile(t, filepath.Join(path, "scripts", "check.sh"), "#!/bin/sh\n")
+			},
+		},
+		{
+			name: "empty directory",
+			add: func(t *testing.T, path string) {
+				if err := os.MkdirAll(filepath.Join(path, "assets", "empty"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), ".agents", "skills", "pin")
+			if _, err := installSkillAt(path, false); err != nil {
+				t.Fatal(err)
+			}
+			test.add(t, path)
+
+			state, err := inspectSkillAt(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if state != skillModified {
+				t.Fatalf("state = %s, want modified", state)
+			}
+			if _, err := installSkillAt(path, false); err == nil {
+				t.Fatal("update unexpectedly replaced a package with local additions")
+			}
+			if _, err := removeSkillAt(path, false); err == nil {
+				t.Fatal("remove unexpectedly deleted a package with local additions")
+			}
+			if !pathExists(path) {
+				t.Fatal("protected package was deleted")
+			}
+		})
+	}
+}
+
+func TestSkillPackageIdentityProtectsEditedSupportingFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".agents", "skills", "pin")
+	if err := writeBundledSkill(path); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(path, "scripts", "check.sh"), "original\n")
+	digest, err := skillPackageDigest(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := skillMarker{Schema: skillMarkerSchema, Skill: pinSkillName, Digest: digest}
+	markerData, err := json.Marshal(marker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(path, skillMarkerName), string(markerData))
+	appendFile(t, filepath.Join(path, "scripts", "check.sh"), "local edit\n")
+
+	state, err := inspectSkillAt(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state != skillModified {
+		t.Fatalf("state = %s, want modified", state)
+	}
+	if _, err := removeSkillAt(path, false); err == nil {
+		t.Fatal("remove unexpectedly deleted an edited supporting file")
+	}
+}
+
+func TestLegacySkillMarkerWithExtraEntryIsModified(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".agents", "skills", "pin")
+	writeFile(t, filepath.Join(path, "SKILL.md"), string(embeddedPinSkill))
+	marker := `{"schema":1,"skill":"pin","digest":"` + skillDigest(embeddedPinSkill) + `"}`
+	writeFile(t, filepath.Join(path, skillMarkerName), marker)
+	writeFile(t, filepath.Join(path, "local.txt"), "keep me\n")
+
+	state, err := inspectSkillAt(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state != skillModified {
+		t.Fatalf("state = %s, want modified", state)
+	}
+	if _, err := installSkillAt(path, false); err == nil {
+		t.Fatal("legacy package with an extra entry was auto-migrated")
+	}
+	if _, err := removeSkillAt(path, false); err == nil {
+		t.Fatal("legacy package with an extra entry was removed")
+	}
+}
+
+func TestSkillPackageSymlinkIsModified(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink setup requires additional Windows privileges")
+	}
+	path := filepath.Join(t.TempDir(), ".agents", "skills", "pin")
+	if _, err := installSkillAt(path, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("SKILL.md", filepath.Join(path, "linked-skill")); err != nil {
+		t.Fatal(err)
+	}
+	state, err := inspectSkillAt(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state != skillModified {
+		t.Fatalf("state = %s, want modified", state)
+	}
+}
+
+func TestSkillInstallPublishFailureRestoresPreviousPackage(t *testing.T) {
+	path := writeOutdatedLegacySkill(t)
+	renameCalls := 0
+	rename := func(oldPath, newPath string) error {
+		renameCalls++
+		if renameCalls == 2 {
+			return errors.New("injected publish failure")
+		}
+		return os.Rename(oldPath, newPath)
+	}
+
+	if _, err := installSkillAtWithRename(path, false, rename); err == nil {
+		t.Fatal("install unexpectedly succeeded")
+	}
+	if got := mustReadFile(t, filepath.Join(path, "SKILL.md")); !strings.Contains(got, "Old instructions") {
+		t.Fatalf("previous package was not restored: %q", got)
+	}
+	matches, err := filepath.Glob(filepath.Join(filepath.Dir(path), ".pin-skill-install-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("temporary install directory was not cleaned up: %#v", matches)
+	}
+}
+
+func TestSkillInstallDoubleRenameFailurePreservesRecoveryPath(t *testing.T) {
+	path := writeOutdatedLegacySkill(t)
+	renameCalls := 0
+	rename := func(oldPath, newPath string) error {
+		renameCalls++
+		if renameCalls >= 2 {
+			return fmt.Errorf("injected rename failure %d", renameCalls)
+		}
+		return os.Rename(oldPath, newPath)
+	}
+
+	_, installErr := installSkillAtWithRename(path, false, rename)
+	if installErr == nil {
+		t.Fatal("install unexpectedly succeeded")
+	}
+	recoveryPaths, err := filepath.Glob(filepath.Join(filepath.Dir(path), ".pin-skill-install-*", "previous"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recoveryPaths) != 1 {
+		t.Fatalf("recovery paths = %#v, want one", recoveryPaths)
+	}
+	if !strings.Contains(installErr.Error(), recoveryPaths[0]) {
+		t.Fatalf("error %q does not report recovery path %q", installErr, recoveryPaths[0])
+	}
+	if got := mustReadFile(t, filepath.Join(recoveryPaths[0], "SKILL.md")); !strings.Contains(got, "Old instructions") {
+		t.Fatalf("preserved package is wrong: %q", got)
+	}
+}
+
+func writeOutdatedLegacySkill(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), ".agents", "skills", "pin")
+	oldSkill := []byte("---\nname: pin\ndescription: old\n---\n\nOld instructions.\n")
+	writeFile(t, filepath.Join(path, "SKILL.md"), string(oldSkill))
+	marker := `{"schema":1,"skill":"pin","digest":"` + skillDigest(oldSkill) + `"}`
+	writeFile(t, filepath.Join(path, skillMarkerName), marker)
+	return path
 }
 
 func TestSkillForcedRemoveDoesNotFollowSymlink(t *testing.T) {
@@ -134,7 +658,7 @@ func TestSkillForcedRemoveDoesNotFollowSymlink(t *testing.T) {
 	home := t.TempDir()
 	target := filepath.Join(home, "user-skill")
 	writeFile(t, filepath.Join(target, "SKILL.md"), "keep me\n")
-	path := filepath.Join(home, ".cursor", "skills", "pin")
+	path := filepath.Join(home, ".agents", "skills", "pin")
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +666,7 @@ func TestSkillForcedRemoveDoesNotFollowSymlink(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	result := runSkillCLI(t, home, "", "skill", "remove", "--target", "cursor", "--force")
+	result := runSkillCLI(t, home, "", "skill", "remove", "--yes", "--force")
 	if result.code != 0 {
 		t.Fatalf("forced symlink removal failed: %s", result.stderr)
 	}
@@ -154,197 +678,13 @@ func TestSkillForcedRemoveDoesNotFollowSymlink(t *testing.T) {
 	}
 }
 
-func TestSkillDefaultDetectionPromptsForAllDirectAgents(t *testing.T) {
-	home := t.TempDir()
-	for _, dir := range []string{".codex", ".claude", ".cursor"} {
-		if err := os.MkdirAll(filepath.Join(home, dir), 0o755); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	result := runSkillCLI(t, home, "n\n", "skill", "install")
-	if result.code != 0 {
-		t.Fatalf("cancel failed: %s", result.stderr)
-	}
-	requireContains(t, result.stdout, "Detected: Codex, Claude Code, Cursor.")
-	requireContains(t, result.stdout, "cancelled")
-	if pathExists(filepath.Join(home, ".agents", "skills", "pin")) {
-		t.Fatal("skill installed after cancellation")
-	}
-
-	result = runSkillCLI(t, home, "\n", "skill", "install")
-	if result.code != 0 {
-		t.Fatalf("confirmed install failed: %s", result.stderr)
-	}
-	for _, path := range []string{
-		filepath.Join(home, ".agents", "skills", "pin"),
-		filepath.Join(home, ".claude", "skills", "pin"),
-		filepath.Join(home, ".cursor", "skills", "pin"),
-	} {
-		if !pathExists(filepath.Join(path, "SKILL.md")) {
-			t.Fatalf("skill missing from %s", path)
-		}
-	}
-}
-
-func TestSkillDefaultMutationRequiresInteractiveConfirmation(t *testing.T) {
-	home := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	result := runSkillCLI(t, home, "", "skill", "install")
-	if result.code == 0 {
-		t.Fatal("install unexpectedly proceeded without confirmation")
-	}
-	requireContains(t, result.stderr, "confirmation required")
-}
-
-func TestSkillRelayTakesPrecedenceAndRemovalCleansManagedCopies(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("Relay process locking is Unix-only")
-	}
-	home := t.TempDir()
-	configRoot := filepath.Join(home, ".config", "relay")
-	central := filepath.Join(configRoot, "skills")
-	claudeSkills := filepath.Join(home, "relay-targets", "claude")
-	codexSkills := filepath.Join(home, "relay-targets", "codex")
-	opencodeSkills := filepath.Join(home, "relay-targets", "opencode")
-	config := `enabled_tools = ["claude", "codex", "opencode"]
-central_skills_dir = "` + central + `"
-claude_skills_dir = "` + claudeSkills + `"
-codex_skills_dir = "` + codexSkills + `"
-opencode_skills_dir = "` + opencodeSkills + `"
-`
-	writeFile(t, filepath.Join(configRoot, "config.toml"), config)
-	for _, dir := range []string{".codex", ".claude", ".cursor"} {
-		if err := os.MkdirAll(filepath.Join(home, dir), 0o755); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	binDir := filepath.Join(home, "bin")
-	relayLog := filepath.Join(home, "relay.log")
-	writeFile(t, filepath.Join(binDir, "relay"), "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$RELAY_TEST_LOG\"\n")
-	if err := os.Chmod(filepath.Join(binDir, "relay"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("RELAY_TEST_LOG", relayLog)
-
-	t.Setenv("PATH", binDir+":/usr/bin:/bin")
-	result := runSkillCLIWithCurrentEnv(t, home, "", "skill", "install", "--yes")
-	if result.code != 0 {
-		t.Fatalf("Relay install failed: %s", result.stderr)
-	}
-	requireContains(t, result.stdout, "installed: relay "+filepath.Join(central, "pin"))
-	if got := mustReadFile(t, relayLog); got != "sync\n" {
-		t.Fatalf("unexpected Relay invocation: %q", got)
-	}
-	if !pathExists(filepath.Join(central, "pin", "SKILL.md")) {
-		t.Fatal("central Relay skill missing")
-	}
-	if pathExists(filepath.Join(home, ".agents", "skills", "pin")) || pathExists(filepath.Join(home, ".cursor", "skills", "pin")) {
-		t.Fatal("PIN bypassed Relay during default installation")
-	}
-
-	for _, base := range []string{claudeSkills, codexSkills, opencodeSkills} {
-		if err := writeBundledSkill(filepath.Join(base, "pin")); err != nil {
-			t.Fatal(err)
-		}
-	}
-	result = runSkillCLIWithCurrentEnv(t, home, "", "skill", "remove", "--yes")
-	if result.code != 0 {
-		t.Fatalf("Relay remove failed: %s", result.stderr)
-	}
-	for _, base := range []string{central, claudeSkills, codexSkills, opencodeSkills} {
-		if pathExists(filepath.Join(base, "pin")) {
-			t.Fatalf("Relay-managed copy still exists under %s", base)
-		}
-	}
-	if !pathExists(filepath.Join(configRoot, "runtime", "relay.lock")) {
-		t.Fatal("Relay-compatible process lock was not used")
-	}
-}
-
-func runSkillCLIWithCurrentEnv(t *testing.T, home, input string, args ...string) cliResult {
-	t.Helper()
-	t.Setenv("HOME", home)
-	t.Setenv("XDG_CONFIG_HOME", "")
-	t.Setenv("RELAY_HOME", "")
-	t.Setenv("CODEX_HOME", "")
-	t.Setenv("CLAUDE_HOME", "")
-	t.Setenv("CURSOR_HOME", "")
-	t.Setenv("OPENCODE_HOME", "")
-	var stdout, stderr bytes.Buffer
-	code := runCLI(args, strings.NewReader(input), &stdout, &stderr)
-	return cliResult{code: code, stdout: stdout.String(), stderr: stderr.String()}
-}
-
-func TestSkillInstallRejectsConfiguredRelayWithoutExecutable(t *testing.T) {
-	home := t.TempDir()
-	configRoot := filepath.Join(home, ".config", "relay")
-	writeFile(t, filepath.Join(configRoot, "config.toml"), "central_skills_dir = \""+filepath.Join(configRoot, "skills")+"\"\n")
-
-	result := runSkillCLI(t, home, "", "skill", "install", "--yes")
-	if result.code == 0 {
-		t.Fatal("install unexpectedly succeeded without Relay executable")
-	}
-	requireContains(t, result.stderr, "relay executable is not in PATH")
-	if pathExists(filepath.Join(configRoot, "skills", "pin")) {
-		t.Fatal("skill source was written before checking Relay executable")
-	}
-}
-
-func TestSkillRelayRemovePreflightsEveryCopy(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("Relay process locking is Unix-only")
-	}
-	home := t.TempDir()
-	configRoot := filepath.Join(home, ".config", "relay")
-	central := filepath.Join(configRoot, "skills")
-	codexSkills := filepath.Join(home, "relay-targets", "codex")
-	config := `enabled_tools = ["codex"]
-central_skills_dir = "` + central + `"
-codex_skills_dir = "` + codexSkills + `"
-`
-	writeFile(t, filepath.Join(configRoot, "config.toml"), config)
-	if err := writeBundledSkill(filepath.Join(central, "pin")); err != nil {
-		t.Fatal(err)
-	}
-	writeFile(t, filepath.Join(codexSkills, "pin", "SKILL.md"), "unmanaged copy\n")
-
-	result := runSkillCLI(t, home, "", "skill", "remove", "--target", "relay")
-	if result.code == 0 {
-		t.Fatal("Relay remove unexpectedly deleted an unmanaged copy")
-	}
-	requireContains(t, result.stderr, "is unmanaged")
-	if !pathExists(filepath.Join(central, "pin")) {
-		t.Fatal("central skill was removed before preflight completed")
-	}
-	if !pathExists(filepath.Join(codexSkills, "pin")) {
-		t.Fatal("unmanaged Relay copy was removed")
-	}
-}
-
-func TestSkillStatusRejectsUnsupportedRelayPathSyntax(t *testing.T) {
-	home := t.TempDir()
-	configRoot := filepath.Join(home, ".config", "relay")
-	writeFile(t, filepath.Join(configRoot, "config.toml"), "central_skills_dir = \"$UNSUPPORTED/skills\"\n")
-
-	result := runSkillCLI(t, home, "", "skill", "status")
-	if result.code == 0 {
-		t.Fatal("status unexpectedly accepted unsupported Relay path syntax")
-	}
-	requireContains(t, result.stderr, "unsupported shell syntax")
-}
-
 func TestSkillCommandHelp(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := runCLI([]string{"skill", "install", "--help"}, strings.NewReader(""), &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("help failed: %s", stderr.String())
 	}
-	requireContains(t, stdout.String(), "Usage: pin skill install")
+	requireContains(t, stdout.String(), "Usage: pin skill install [--yes] [--force]")
 }
 
 func TestE2ESkillLifecycleCompiledBinary(t *testing.T) {
@@ -360,7 +700,7 @@ func TestE2ESkillLifecycleCompiledBinary(t *testing.T) {
 
 	runBinary := func(args ...string) cliResult {
 		command := exec.Command(bin, args...)
-		command.Env = append(os.Environ(), "HOME="+home, "PATH=/usr/bin:/bin", "XDG_CONFIG_HOME=")
+		command.Env = append(os.Environ(), "HOME="+home, "PATH=/usr/bin:/bin", "XDG_CONFIG_HOME=", "CLAUDE_CONFIG_DIR=")
 		var stdout, stderr bytes.Buffer
 		command.Stdout = &stdout
 		command.Stderr = &stderr
@@ -376,13 +716,13 @@ func TestE2ESkillLifecycleCompiledBinary(t *testing.T) {
 		return cliResult{code: code, stdout: stdout.String(), stderr: stderr.String()}
 	}
 
-	result := runBinary("skill", "install", "--target", "codex")
+	result := runBinary("skill", "install", "--yes")
 	if result.code != 0 {
 		t.Fatalf("compiled install failed: %s", result.stderr)
 	}
-	result = runBinary("skill", "status", "--target", "codex")
-	requireContains(t, result.stdout, "codex: current")
-	result = runBinary("skill", "remove", "--target", "codex")
+	result = runBinary("skill", "status")
+	requireContains(t, result.stdout, "pin: current")
+	result = runBinary("skill", "remove", "--yes")
 	if result.code != 0 {
 		t.Fatalf("compiled remove failed: %s", result.stderr)
 	}

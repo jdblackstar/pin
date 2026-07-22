@@ -219,7 +219,11 @@ func resolveSourceContext(toolOrPath string, hasArg bool, opts globalOptions) (p
 		return pinContext{}, fmt.Errorf("path does not exist: %s", candidate)
 	}
 
-	ctx, metadata, err := resolveToolInstall(toolOrPath, opts)
+	return resolveInstalledSourceContext(toolOrPath, opts)
+}
+
+func resolveInstalledSourceContext(tool string, opts globalOptions) (pinContext, error) {
+	ctx, metadata, err := resolveToolInstall(tool, opts)
 	if err != nil {
 		return pinContext{}, err
 	}

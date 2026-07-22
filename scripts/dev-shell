@@ -1,0 +1,105 @@
+#!/bin/sh
+
+set -eu
+
+usage() {
+	cat <<'EOF'
+Usage: scripts/dev-shell [profile] [-- command [args...]]
+
+Build the current checkout and enter an isolated pin development environment.
+The profile defaults to "default" and persists until scripts/dev-reset removes it.
+EOF
+}
+
+case "${1-}" in
+	-h|--help)
+		usage
+		exit 0
+		;;
+esac
+
+profile=default
+if [ "$#" -gt 0 ] && [ "$1" != "--" ]; then
+	profile=$1
+	shift
+fi
+
+case "$profile" in
+	*[!A-Za-z0-9._-]*|[!A-Za-z0-9]*|'')
+		echo "dev-shell: invalid profile name: $profile" >&2
+		exit 2
+		;;
+esac
+
+if [ "$#" -gt 0 ]; then
+	if [ "$1" != "--" ]; then
+		usage >&2
+		exit 2
+	fi
+	shift
+fi
+
+repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+build_dir="$repo/.pin-dev/bin"
+candidate="$build_dir/pin"
+mkdir -p "$build_dir"
+
+sha=$(git -C "$repo" rev-parse --short=12 HEAD)
+version="dev-$sha"
+if ! git -C "$repo" diff --quiet --ignore-submodules -- ||
+	! git -C "$repo" diff --cached --quiet --ignore-submodules -- ||
+	[ -n "$(git -C "$repo" ls-files --others --exclude-standard)" ]; then
+	version="$version-dirty"
+fi
+
+tmp="$candidate.tmp.$$"
+trap 'rm -f "$tmp"' EXIT HUP INT TERM
+go -C "$repo" build -trimpath \
+	-ldflags "-X github.com/jdblackstar/pin/app.version=$version" \
+	-o "$tmp" .
+mv "$tmp" "$candidate"
+trap - EXIT HUP INT TERM
+
+if [ -n "${PIN_DEV_HOME-}" ]; then
+	dev_home=$PIN_DEV_HOME
+else
+	data_home=${XDG_DATA_HOME:-"$HOME/.local/share"}
+	dev_home="$data_home/pin-dev"
+fi
+
+export PIN_DEV_HOME="$dev_home"
+export PIN_DEV_PROFILE="$profile"
+export PIN_HOME="$dev_home/profiles/$profile"
+mkdir -p "$PIN_HOME"
+PATH="$build_dir:$PATH"
+export PATH
+
+if [ "$#" -gt 0 ]; then
+	exec "$@"
+fi
+
+shell=${SHELL:-/bin/sh}
+
+echo "pin development shell (profile: $profile)"
+echo "candidate: $candidate ($version)"
+echo "PIN_HOME: $PIN_HOME"
+echo "Exit this shell to restore your normal pin environment."
+
+case "${shell##*/}" in
+	bash)
+		export PIN_DEV_ORIGINAL_BASHRC=${PIN_DEV_ORIGINAL_BASHRC:-"$HOME/.bashrc"}
+		exec "$shell" --rcfile "$repo/scripts/dev-shell-rc/bashrc" -i
+		;;
+	zsh)
+		export PIN_DEV_ORIGINAL_ZDOTDIR=${PIN_DEV_ORIGINAL_ZDOTDIR:-${ZDOTDIR:-$HOME}}
+		export PIN_DEV_WRAPPER_ZDOTDIR="$repo/scripts/dev-shell-rc/zsh"
+		export ZDOTDIR="$PIN_DEV_WRAPPER_ZDOTDIR"
+		exec "$shell" -i
+		;;
+	*)
+		PS1="[pin dev:$profile] ${PS1-\$ }"
+		PROMPT="$PS1"
+		export PS1 PROMPT
+		exec "$shell" -i
+		;;
+esac

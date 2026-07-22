@@ -1,0 +1,6 @@
+if [ -r "$PIN_DEV_ORIGINAL_BASHRC" ]; then
+	. "$PIN_DEV_ORIGINAL_BASHRC"
+fi
+
+PS1="[pin dev:${PIN_DEV_PROFILE}] ${PS1-\$ }"
+export PS1

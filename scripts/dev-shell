@@ -70,6 +70,7 @@ fi
 export PIN_DEV_HOME="$dev_home"
 export PIN_DEV_PROFILE="$profile"
 export PIN_HOME="$dev_home/profiles/$profile"
+export PIN_SKILL_HOME="$PIN_HOME/skill-home"
 mkdir -p "$PIN_HOME"
 PATH="$build_dir:$PATH"
 export PATH
@@ -83,6 +84,7 @@ shell=${SHELL:-/bin/sh}
 echo "pin development shell (profile: $profile)"
 echo "candidate: $candidate ($version)"
 echo "PIN_HOME: $PIN_HOME"
+echo "PIN_SKILL_HOME: $PIN_SKILL_HOME"
 echo "Exit this shell to restore your normal pin environment."
 
 case "${shell##*/}" in

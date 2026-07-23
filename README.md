@@ -113,7 +113,11 @@ scripts/dev-shell ux-test
 The helper builds the current checkout, labels it with the commit SHA (and
 `-dirty` when applicable), and prepends the candidate to `PATH`. It also sets
 `PIN_HOME` to the persistent, named profile at
-`~/.local/share/pin-dev/profiles/ux-test`. Inside the shell,
+`~/.local/share/pin-dev/profiles/ux-test` and scopes skill lifecycle commands
+to that profile with `PIN_SKILL_HOME`. This keeps both the canonical skill and
+PIN's Claude Code compatibility copy out of live user locations; ambient Relay
+sync is skipped because its provider configuration may refer to live paths.
+Inside the shell,
 `command -v pin` points at `.pin-dev/bin/pin`; exiting restores the caller's
 normal environment. Bash and zsh load their normal startup files before the
 helper adds a `[pin dev:ux-test]` prompt prefix. Go's normal shared build cache

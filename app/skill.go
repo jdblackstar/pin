@@ -29,6 +29,7 @@ const (
 	relayScopedSkillSyncVersion    = 1
 	relayCapabilitiesTimeout       = 2 * time.Second
 	relayScopedSkillSyncTimeout    = 30 * time.Second
+	relayCommandWaitDelay          = 250 * time.Millisecond
 )
 
 //go:embed assets/pin-skill/SKILL.md
@@ -56,8 +57,9 @@ type skillTarget struct {
 }
 
 type skillEnvironment struct {
-	canonical skillTarget
-	claude    skillTarget
+	canonical      skillTarget
+	claude         skillTarget
+	allowRelaySync bool
 }
 
 type skillMutationOptions struct {
@@ -113,6 +115,7 @@ func (relay relayAdapter) run(timeout time.Duration, args ...string) ([]byte, er
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	command := exec.CommandContext(ctx, relay.executable, args...)
+	command.WaitDelay = relayCommandWaitDelay
 	output, err := command.Output()
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return nil, fmt.Errorf("relay command timed out")
@@ -199,12 +202,13 @@ func (a app) commandSkillInstall(args []string) error {
 	}
 	printSkillInstallResult(a.stdout, changed, "skill", env.canonical.path)
 
-	relay, found := findRelayAdapter()
 	var relaySyncErr error
-	if found && relay.supportsScopedSkillSync() {
-		relaySyncErr = relay.syncSkill(env.canonical.path)
-		if relaySyncErr == nil {
-			return nil
+	if env.allowRelaySync {
+		if relay, found := findRelayAdapter(); found && relay.supportsScopedSkillSync() {
+			relaySyncErr = relay.syncSkill(env.canonical.path)
+			if relaySyncErr == nil {
+				return nil
+			}
 		}
 	}
 
@@ -371,16 +375,32 @@ func detectSkillEnvironment() (skillEnvironment, error) {
 	if err != nil {
 		return skillEnvironment{}, fmt.Errorf("resolve home directory: %w", err)
 	}
-	canonicalPath := filepath.Join(home, ".agents", "skills", pinSkillName)
+	skillHome := home
+	allowRelaySync := true
+	skillHomeOverridden := false
+	if value := strings.TrimSpace(os.Getenv("PIN_SKILL_HOME")); value != "" {
+		skillHome = expandSkillPath(value, home)
+		skillHomeOverridden = true
+		// A skill-home override is an isolated development boundary. Relay's
+		// provider configuration is independent and may point back at live
+		// locations, so use PIN's standalone compatibility handling here.
+		allowRelaySync = false
+	}
+	canonicalPath := filepath.Join(skillHome, ".agents", "skills", pinSkillName)
 	claudeConfigSet := strings.TrimSpace(os.Getenv("CLAUDE_CONFIG_DIR")) != ""
-	claudeHome := toolHome(home, "CLAUDE_CONFIG_DIR", ".claude")
+	detectedClaudeHome := toolHome(home, "CLAUDE_CONFIG_DIR", ".claude")
+	claudeHome := detectedClaudeHome
+	if skillHomeOverridden {
+		claudeHome = filepath.Join(skillHome, ".claude")
+	}
 	claudePath := filepath.Join(claudeHome, "skills", pinSkillName)
 	return skillEnvironment{
 		canonical: skillTarget{path: canonicalPath, detected: true},
 		claude: skillTarget{
 			path:     claudePath,
-			detected: claudeConfigSet || pathExists(claudeHome) || pathExists(claudePath) || executableExists("claude"),
+			detected: claudeConfigSet || pathExists(detectedClaudeHome) || executableExists("claude"),
 		},
+		allowRelaySync: allowRelaySync,
 	}, nil
 }
 

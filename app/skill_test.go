@@ -31,6 +31,7 @@ func runSkillCLIWithPathAndClaudeConfig(t *testing.T, home, path, claudeConfig, 
 	t.Setenv("RELAY_HOME", "")
 	t.Setenv("CODEX_HOME", "")
 	t.Setenv("CLAUDE_CONFIG_DIR", claudeConfig)
+	t.Setenv("PIN_SKILL_HOME", "")
 	t.Setenv("CURSOR_HOME", "")
 	t.Setenv("OPENCODE_HOME", "")
 	t.Setenv("PATH", path)
@@ -481,6 +482,89 @@ func TestSkillInstallHonorsClaudeConfigDir(t *testing.T) {
 	}
 }
 
+func TestSkillHomeOverrideIsolatesDestinationsAndSkipsRelay(t *testing.T) {
+	home := t.TempDir()
+	skillHome := filepath.Join(t.TempDir(), "isolated skill home")
+	liveClaudeConfig := filepath.Join(home, "live-claude")
+	if err := os.MkdirAll(liveClaudeConfig, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	liveCanonicalSentinel := filepath.Join(home, ".agents", "skills", "pin", "keep")
+	liveClaudeSentinel := filepath.Join(liveClaudeConfig, "skills", "pin", "keep")
+	writeFile(t, liveCanonicalSentinel, "live canonical\n")
+	writeFile(t, liveClaudeSentinel, "live Claude\n")
+	path, relayLog := installFakeRelay(t, home, "supported")
+	t.Setenv("HOME", home)
+	t.Setenv("PIN_SKILL_HOME", skillHome)
+	t.Setenv("CLAUDE_CONFIG_DIR", liveClaudeConfig)
+	t.Setenv("PATH", path)
+
+	var stdout, stderr bytes.Buffer
+	code := runCLI(
+		[]string{"skill", "install", "--yes"},
+		strings.NewReader(""),
+		&stdout,
+		&stderr,
+	)
+	if code != 0 {
+		t.Fatalf("install failed: %s", stderr.String())
+	}
+	for _, path := range []string{
+		filepath.Join(skillHome, ".agents", "skills", "pin", "SKILL.md"),
+		filepath.Join(skillHome, ".claude", "skills", "pin", "SKILL.md"),
+	} {
+		if !pathExists(path) {
+			t.Fatalf("isolated skill missing at %s", path)
+		}
+	}
+	if got := mustReadFile(t, liveCanonicalSentinel); got != "live canonical\n" {
+		t.Fatalf("live canonical skill changed: %q", got)
+	}
+	if got := mustReadFile(t, liveClaudeSentinel); got != "live Claude\n" {
+		t.Fatalf("live Claude skill changed: %q", got)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = runCLI(
+		[]string{"skill", "remove", "--yes"},
+		strings.NewReader(""),
+		&stdout,
+		&stderr,
+	)
+	if code != 0 {
+		t.Fatalf("remove failed: %s", stderr.String())
+	}
+	for _, path := range []string{
+		filepath.Join(skillHome, ".agents", "skills", "pin"),
+		filepath.Join(skillHome, ".claude", "skills", "pin"),
+	} {
+		if pathExists(path) {
+			t.Fatalf("isolated skill remained after removal at %s", path)
+		}
+	}
+	if got := mustReadFile(t, liveCanonicalSentinel); got != "live canonical\n" {
+		t.Fatalf("removal changed live canonical skill: %q", got)
+	}
+	if got := mustReadFile(t, liveClaudeSentinel); got != "live Claude\n" {
+		t.Fatalf("removal changed live Claude skill: %q", got)
+	}
+	if _, err := os.Stat(relayLog); !os.IsNotExist(err) {
+		t.Fatalf("Relay was invoked inside isolated skill home: %v", err)
+	}
+}
+
+func TestSkillInstallWithoutOverrideUsesNormalHome(t *testing.T) {
+	home := t.TempDir()
+	result := runSkillCLI(t, home, "", "skill", "install", "--yes")
+	if result.code != 0 {
+		t.Fatalf("install failed: %s", result.stderr)
+	}
+	if !pathExists(filepath.Join(home, ".agents", "skills", "pin", "SKILL.md")) {
+		t.Fatal("canonical skill did not use HOME")
+	}
+}
+
 func TestSkillStatusReportsCanonicalAndClaudeCompatibility(t *testing.T) {
 	home := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(home, ".claude"), 0o755); err != nil {
@@ -763,7 +847,14 @@ func TestE2ESkillLifecycleCompiledBinary(t *testing.T) {
 
 	runBinary := func(args ...string) cliResult {
 		command := exec.Command(bin, args...)
-		command.Env = append(os.Environ(), "HOME="+home, "PATH=/usr/bin:/bin", "XDG_CONFIG_HOME=", "CLAUDE_CONFIG_DIR=")
+		command.Env = append(
+			os.Environ(),
+			"HOME="+home,
+			"PATH=/usr/bin:/bin",
+			"XDG_CONFIG_HOME=",
+			"CLAUDE_CONFIG_DIR=",
+			"PIN_SKILL_HOME=",
+		)
 		var stdout, stderr bytes.Buffer
 		command.Stdout = &stdout
 		command.Stderr = &stderr

@@ -29,22 +29,39 @@ func TestDevShellIsolatesAndPersistsNamedProfile(t *testing.T) {
 	}
 	t.Setenv("PIN_DEV_HOME", realDevHome)
 
+	realHome := t.TempDir()
+	realClaudeConfig := filepath.Join(realHome, "claude-config")
+	if err := os.MkdirAll(realClaudeConfig, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	devHome := filepath.Join(t.TempDir(), "pin-dev")
 	script := filepath.Join(repo, "scripts", "dev-shell")
+	devEnv := envWith(
+		os.Environ(),
+		"PIN_DEV_HOME="+devHome,
+		"HOME="+realHome,
+		"CLAUDE_CONFIG_DIR="+realClaudeConfig,
+		"GOMODCACHE="+goEnv(t, "GOMODCACHE"),
+		"GOCACHE="+goEnv(t, "GOCACHE"),
+	)
 
 	command := exec.Command(script, "ux-test", "--", "sh", "-c", `
 		[ "$PIN_DEV_PROFILE" = ux-test ] || exit 10
 		[ "$PIN_HOME" = "$PIN_DEV_HOME/profiles/ux-test" ] || exit 11
+		[ "$PIN_SKILL_HOME" = "$PIN_HOME/skill-home" ] || exit 14
 		[ "$(command -v pin)" = "$PWD/.pin-dev/bin/pin" ] || exit 12
 		case "$(pin version)" in
 			"pin dev-"*) ;;
 			*) exit 13 ;;
 		esac
+		pin skill install --yes || exit 15
+		[ -f "$PIN_SKILL_HOME/.agents/skills/pin/SKILL.md" ] || exit 16
+		[ -f "$PIN_SKILL_HOME/.claude/skills/pin/SKILL.md" ] || exit 17
 		touch "$PIN_HOME/persisted"
 		exit 23
 	`)
 	command.Dir = repo
-	command.Env = envWith(os.Environ(), "PIN_DEV_HOME="+devHome)
+	command.Env = devEnv
 	output, err := command.CombinedOutput()
 	if exit, ok := err.(*exec.ExitError); !ok || exit.ExitCode() != 23 {
 		t.Fatalf("dev-shell exit = %v, want 23\n%s", err, output)
@@ -52,9 +69,42 @@ func TestDevShellIsolatesAndPersistsNamedProfile(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(devHome, "profiles", "ux-test", "persisted")); err != nil {
 		t.Fatalf("profile did not persist: %v", err)
 	}
+	for _, path := range []string{
+		filepath.Join(realHome, ".agents", "skills", "pin"),
+		filepath.Join(realClaudeConfig, "skills", "pin"),
+	} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("skill escaped development profile to %s: %v", path, err)
+		}
+	}
+
+	command = exec.Command(script, "ux-test", "--", "pin", "skill", "status")
+	command.Dir = repo
+	command.Env = devEnv
+	output, err = command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("persistent profile status failed: %v\n%s", err, output)
+	}
+	if !strings.Contains(string(output), "pin: current path="+filepath.Join(devHome, "profiles", "ux-test", "skill-home", ".agents", "skills", "pin")) {
+		t.Fatalf("persistent profile lost canonical skill:\n%s", output)
+	}
+	if !strings.Contains(string(output), "claude compatibility: current") {
+		t.Fatalf("persistent profile lost Claude compatibility copy:\n%s", output)
+	}
+
+	command = exec.Command(script, "other-profile", "--", "pin", "skill", "install", "--yes")
+	command.Dir = repo
+	command.Env = devEnv
+	if output, err = command.CombinedOutput(); err != nil {
+		t.Fatalf("second profile install failed: %v\n%s", err, output)
+	}
+	otherSkill := filepath.Join(devHome, "profiles", "other-profile", "skill-home", ".agents", "skills", "pin")
+	if _, err := os.Stat(filepath.Join(otherSkill, "SKILL.md")); err != nil {
+		t.Fatalf("second profile skill missing: %v", err)
+	}
 
 	reset := exec.Command(filepath.Join(repo, "scripts", "dev-reset"), "ux-test")
-	reset.Env = envWith(os.Environ(), "PIN_DEV_HOME="+devHome)
+	reset.Env = devEnv
 	if output, err := reset.CombinedOutput(); err != nil {
 		t.Fatalf("dev-reset failed: %v\n%s", err, output)
 	}
@@ -63,6 +113,9 @@ func TestDevShellIsolatesAndPersistsNamedProfile(t *testing.T) {
 	}
 	if _, err := os.Stat(realSentinel); err != nil {
 		t.Fatalf("existing PIN_DEV_HOME was modified: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(otherSkill, "SKILL.md")); err != nil {
+		t.Fatalf("reset removed another profile's skill: %v", err)
 	}
 }
 
@@ -177,4 +230,14 @@ func envWith(base []string, overrides ...string) []string {
 		env = append(env, entry)
 	}
 	return append(env, overrides...)
+}
+
+func goEnv(t *testing.T, name string) string {
+	t.Helper()
+	command := exec.Command("go", "env", name)
+	output, err := command.Output()
+	if err != nil {
+		t.Fatalf("go env %s failed: %v", name, err)
+	}
+	return strings.TrimSpace(string(output))
 }

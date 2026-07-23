@@ -14,6 +14,36 @@ Install the `pin` CLI with Homebrew:
 brew install jdblackstar/tap/pin
 ```
 
+## Install the agent skill
+
+Install the bundled `pin` skill so supported coding agents can discover how to
+initialize, update, verify, run, and roll back PIN-managed tools:
+
+```bash
+pin skill install
+```
+
+PIN always installs the canonical skill at `~/.agents/skills/pin`, which is
+shared by compatible coding agents. When an installed Relay advertises scoped
+skill synchronization, PIN quietly asks it to reconcile only this skill with
+configured compatibility locations. PIN never runs a broad Relay sync and does
+not require or start `relay watch`.
+
+Relay is optional. Without compatible scoped synchronization, PIN installs a
+standard Claude Code compatibility copy when Claude Code is detected. Missing,
+older, or incompatible Relay versions do not prevent the canonical skill from
+being installed.
+
+PIN records a digest next to each copy it writes so upgrades are idempotent and
+locally modified or unmanaged skills are not replaced without `--force`.
+
+Inspect or remove the installed skill with:
+
+```bash
+pin skill status
+pin skill remove
+```
+
 ## What pin Does
 
 - reads a repo-local `pin.toml`
@@ -83,7 +113,11 @@ scripts/dev-shell ux-test
 The helper builds the current checkout, labels it with the commit SHA (and
 `-dirty` when applicable), and prepends the candidate to `PATH`. It also sets
 `PIN_HOME` to the persistent, named profile at
-`~/.local/share/pin-dev/profiles/ux-test`. Inside the shell,
+`~/.local/share/pin-dev/profiles/ux-test` and scopes skill lifecycle commands
+to that profile with `PIN_SKILL_HOME`. This keeps both the canonical skill and
+PIN's Claude Code compatibility copy out of live user locations; ambient Relay
+sync is skipped because its provider configuration may refer to live paths.
+Inside the shell,
 `command -v pin` points at `.pin-dev/bin/pin`; exiting restores the caller's
 normal environment. Bash and zsh load their normal startup files before the
 helper adds a `[pin dev:ux-test]` prompt prefix. Go's normal shared build cache
@@ -274,6 +308,9 @@ runtime files added alongside the repo contents:
 
 ```bash
 pin init [path]
+pin skill install [--yes] [--force]
+pin skill remove [--yes] [--force]
+pin skill status
 pin status [tool_or_path]
 pin check [tool_or_path | --all]
 pin update [tool_or_path | --all [--yes]]

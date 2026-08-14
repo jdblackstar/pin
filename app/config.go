@@ -71,23 +71,16 @@ func (ctx pinContext) previousLink() string {
 }
 
 func resolveContext(toolOrPath string, hasArg bool, opts globalOptions) (pinContext, error) {
-	var candidate string
-	if !hasArg {
-		wd, err := os.Getwd()
-		if err != nil {
-			return pinContext{}, err
-		}
-		candidate = wd
-	} else {
-		candidate = expandPath(toolOrPath)
+	candidate, err := resolveContextCandidate(toolOrPath, hasArg)
+	if err != nil {
+		return pinContext{}, err
 	}
 
 	if !hasArg || pathExists(candidate) {
 		configPath, ok := findConfig(candidate)
 		if !ok {
 			if !hasArg {
-				wd, _ := os.Getwd()
-				return pinContext{}, fmt.Errorf("no %s found from %s", configName, wd)
+				return pinContext{}, fmt.Errorf("no %s found from %s", configName, candidate)
 			}
 			return pinContext{}, fmt.Errorf("no %s found at %s", configName, candidate)
 		}
@@ -188,23 +181,16 @@ func legacyInstall(name string, opts globalOptions) (pinContext, releaseMetadata
 }
 
 func resolveSourceContext(toolOrPath string, hasArg bool, opts globalOptions) (pinContext, error) {
-	var candidate string
-	if !hasArg {
-		wd, err := os.Getwd()
-		if err != nil {
-			return pinContext{}, err
-		}
-		candidate = wd
-	} else {
-		candidate = expandPath(toolOrPath)
+	candidate, err := resolveContextCandidate(toolOrPath, hasArg)
+	if err != nil {
+		return pinContext{}, err
 	}
 
 	if !hasArg || pathExists(candidate) {
 		configPath, ok := findConfig(candidate)
 		if !ok {
 			if !hasArg {
-				wd, _ := os.Getwd()
-				return pinContext{}, fmt.Errorf("no %s found from %s", configName, wd)
+				return pinContext{}, fmt.Errorf("no %s found from %s", configName, candidate)
 			}
 			return pinContext{}, fmt.Errorf("no %s found at %s", configName, candidate)
 		}
@@ -220,6 +206,13 @@ func resolveSourceContext(toolOrPath string, hasArg bool, opts globalOptions) (p
 	}
 
 	return resolveInstalledSourceContext(toolOrPath, opts)
+}
+
+func resolveContextCandidate(toolOrPath string, hasArg bool) (string, error) {
+	if hasArg {
+		return expandPath(toolOrPath), nil
+	}
+	return os.Getwd()
 }
 
 func resolveInstalledSourceContext(tool string, opts globalOptions) (pinContext, error) {

@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1883,6 +1884,34 @@ func TestUpdateRebuildsReleaseMissingMetadata(t *testing.T) {
 	requireReleaseMetadata(t, root, sha)
 	if _, err := os.Stat(filepath.Join(release, "interrupted-build")); !os.IsNotExist(err) {
 		t.Fatalf("incomplete release contents survived rebuild: %v", err)
+	}
+}
+
+func TestCleanupFailedReleaseReportsErrorAndLeavesPath(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "release")
+	marker := filepath.Join(path, "marker")
+	writeFile(t, marker, "incomplete\n")
+	cause := errors.New("install python runtime: command failed")
+	cleanupAttempts := 0
+	err := cleanupFailedRelease(path, cause, func(got string) error {
+		cleanupAttempts++
+		if got != path {
+			t.Fatalf("cleanup path = %q, want %q", got, path)
+		}
+		return os.ErrPermission
+	})
+
+	if !errors.Is(err, cause) || !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("cleanup error = %v, want both errors", err)
+	}
+	requireContains(t, err.Error(), cause.Error())
+	requireContains(t, err.Error(), "cleanup incomplete release: permission denied")
+	requireContains(t, err.Error(), "incomplete path: "+path)
+	if cleanupAttempts != 1 {
+		t.Fatalf("cleanup attempts = %d, want 1", cleanupAttempts)
+	}
+	if got := mustReadFile(t, marker); got != "incomplete\n" {
+		t.Fatalf("incomplete marker = %q, want unchanged", got)
 	}
 }
 

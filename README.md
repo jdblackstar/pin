@@ -351,5 +351,6 @@ are used when no namespaced install exists.
 - candidate verification fails
 
 Candidates that are built but fail verification or activation stay in place for
-inspection. Build-time failures are cleaned up, and failed candidates are not
-made current.
+inspection. Pin attempts to clean up build-time failures. If cleanup fails, Pin
+reports the remaining path. The next update rebuilds an incomplete release only
+when it is inactive. Failed candidates are not made current.

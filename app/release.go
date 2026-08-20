@@ -484,10 +484,16 @@ func buildRelease(ctx pinContext, config config, sha string) (string, error) {
 
 func cleanupOnError(path string, run func() error) error {
 	if err := run(); err != nil {
-		_ = os.RemoveAll(path)
-		return err
+		return cleanupFailedRelease(path, err, os.RemoveAll)
 	}
 	return nil
+}
+
+func cleanupFailedRelease(path string, cause error, removeAll func(string) error) error {
+	if err := removeAll(path); err != nil {
+		return errors.Join(cause, fmt.Errorf("cleanup incomplete release: %w\nincomplete path: %s", err, path))
+	}
+	return cause
 }
 
 func extractGitArchive(repo, sha, destination string) error {

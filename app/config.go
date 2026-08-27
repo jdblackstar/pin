@@ -77,35 +77,15 @@ func resolveContext(toolOrPath string, hasArg bool, opts globalOptions) (pinCont
 	}
 
 	if !hasArg || pathExists(candidate) {
-		configPath, ok := findConfig(candidate)
-		if !ok {
-			if !hasArg {
-				return pinContext{}, fmt.Errorf("no %s found from %s", configName, candidate)
-			}
-			return pinContext{}, fmt.Errorf("no %s found at %s", configName, candidate)
+		configPath, err := contextConfigPath(candidate, hasArg)
+		if err != nil {
+			return pinContext{}, err
 		}
 		config, err := loadConfig(configPath)
 		if err != nil {
 			return pinContext{}, err
 		}
-		ctx := pinContext{config.name, opts.pinHome, config}
-		metadata, err := readMetadataForTool(opts.pinHome, ctx.name)
-		if err != nil {
-			if ok, legacyErr := legacyInstallExists(ctx.name, opts); legacyErr == nil && ok {
-				ctx.pinHome = opts.legacyPinHome
-				return ctx, nil
-			}
-			return pinContext{}, err
-		}
-		if metadata == nil {
-			if ok, err := legacyInstallExists(ctx.name, opts); err != nil || ok {
-				if err != nil {
-					return pinContext{}, err
-				}
-				ctx.pinHome = opts.legacyPinHome
-			}
-		}
-		return ctx, nil
+		return sourceContextForConfig(config, opts)
 	}
 
 	if looksLikePath(toolOrPath) {
@@ -187,12 +167,9 @@ func resolveSourceContext(toolOrPath string, hasArg bool, opts globalOptions) (p
 	}
 
 	if !hasArg || pathExists(candidate) {
-		configPath, ok := findConfig(candidate)
-		if !ok {
-			if !hasArg {
-				return pinContext{}, fmt.Errorf("no %s found from %s", configName, candidate)
-			}
-			return pinContext{}, fmt.Errorf("no %s found at %s", configName, candidate)
+		configPath, err := contextConfigPath(candidate, hasArg)
+		if err != nil {
+			return pinContext{}, err
 		}
 		config, err := loadCommittedConfig(filepath.Dir(configPath))
 		if err != nil {
@@ -213,6 +190,16 @@ func resolveContextCandidate(toolOrPath string, hasArg bool) (string, error) {
 		return expandPath(toolOrPath), nil
 	}
 	return os.Getwd()
+}
+
+func contextConfigPath(candidate string, hasArg bool) (string, error) {
+	if configPath, ok := findConfig(candidate); ok {
+		return configPath, nil
+	}
+	if hasArg {
+		return "", fmt.Errorf("no %s found at %s", configName, candidate)
+	}
+	return "", fmt.Errorf("no %s found from %s", configName, candidate)
 }
 
 func resolveInstalledSourceContext(tool string, opts globalOptions) (pinContext, error) {

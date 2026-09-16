@@ -1452,7 +1452,7 @@ func TestE2ECompiledBinaryInjectRefusesSymlinkedArchiveParent(t *testing.T) {
 
 	result := runTool(t, runCompiledPin, root, repo, "update")
 	requireCode(t, result, 2)
-	requireContains(t, result.stderr, "inject parent is a symlink in archived checkout")
+	requireContains(t, result.stderr, "archived symlink must resolve inside release")
 	data, err := os.ReadFile(filepath.Join(outside, "local.toml"))
 	if err != nil {
 		t.Fatal(err)

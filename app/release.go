@@ -457,6 +457,7 @@ func buildRelease(ctx pinContext, config config, sha string) (string, error) {
 	if err := cleanupOnError(temp, func() error {
 		return runSteps(
 			releaseStep{"extract source", func() error { return extractGitArchive(config.sourcePath, sha, temp) }},
+			releaseStep{"validate archived symlinks", func() error { return validateArchivedSymlinks(temp) }},
 			releaseStep{"check runtime paths", func() error { return ensureRuntimePathsAvailable(temp) }},
 			releaseStep{"inject runtime paths", func() error { return injectRuntimePaths(ctx, temp, config) }},
 		)
@@ -531,6 +532,35 @@ func extractGitArchive(repo, sha, destination string) error {
 		return fmt.Errorf("tar extract failed: %s", strings.TrimSpace(extractStderr.String()))
 	}
 	return nil
+}
+
+func validateArchivedSymlinks(release string) error {
+	root, err := os.OpenRoot(release)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+
+	return filepath.WalkDir(release, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.Type()&os.ModeSymlink == 0 {
+			return nil
+		}
+		target, err := os.Readlink(path)
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(release, path)
+		if err != nil {
+			return err
+		}
+		if _, err := root.Stat(rel); err != nil {
+			return fmt.Errorf("archived symlink must resolve inside release: %s -> %s: %w", path, target, err)
+		}
+		return nil
+	})
 }
 
 func ensureRuntimePathsAvailable(release string) error {

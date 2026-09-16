@@ -279,6 +279,7 @@ func sourceRepo(t *testing.T, root string) (string, string) {
 	run(t, "", "git", "clone", remote, repo)
 	git(t, repo, "config", "user.email", "pin@example.test")
 	git(t, repo, "config", "user.name", "Pin Test")
+	git(t, repo, "config", "commit.gpgsign", "false")
 	writeTool(t, repo, "1")
 	git(t, repo, "add", ".")
 	git(t, repo, "commit", "-m", "initial")

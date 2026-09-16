@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+go_bin="$HOME/.local/share/amp/toolchains/go/current/bin/go"
+if [[ ! -x "$go_bin" ]]; then
+	printf 'PIN orb toolchain is missing; rerun .agents/setup.\n' >&2
+	exit 1
+fi
+
+"$go_bin" version >/dev/null

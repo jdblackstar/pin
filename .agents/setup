@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+started_at=$SECONDS
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+step() {
+	printf '\n==> %s\n' "$1"
+}
+
+step "Checking system prerequisites"
+packages=()
+command -v curl >/dev/null 2>&1 || packages+=(curl)
+command -v git >/dev/null 2>&1 || packages+=(git)
+command -v tar >/dev/null 2>&1 || packages+=(tar)
+if ! command -v python3 >/dev/null 2>&1; then
+	packages+=(python3 python3-venv)
+elif ! python3 -m venv --help >/dev/null 2>&1; then
+	packages+=(python3-venv)
+fi
+[[ -s /etc/ssl/certs/ca-certificates.crt ]] || packages+=(ca-certificates)
+
+if ((${#packages[@]})); then
+	apt=(apt-get)
+	if ((EUID != 0)); then
+		apt=(sudo apt-get)
+	fi
+	"${apt[@]}" update
+	DEBIAN_FRONTEND=noninteractive "${apt[@]}" install -y --no-install-recommends "${packages[@]}"
+fi
+
+required_go="$(awk '$1 == "go" { print $2; exit }' "$repo_root/go.mod")"
+if [[ ! "$required_go" =~ ^[0-9]+\.[0-9]+$ ]]; then
+	printf 'Unable to determine the required Go version from go.mod: %q\n' "$required_go" >&2
+	exit 1
+fi
+
+toolchain_root="$HOME/.local/share/amp/toolchains/go"
+active_toolchain="$toolchain_root/current"
+go_bin="$active_toolchain/bin/go"
+
+go_is_compatible() {
+	local candidate=$1
+	local installed
+	installed="$("$candidate" env GOVERSION 2>/dev/null || true)"
+	python3 - "$required_go" "$installed" <<'PY'
+import re
+import sys
+
+required = tuple(map(int, sys.argv[1].split(".")))
+match = re.fullmatch(r"go(\d+)\.(\d+)(?:\.\d+)?", sys.argv[2])
+raise SystemExit(0 if match and tuple(map(int, match.groups())) >= required else 1)
+PY
+}
+
+if [[ ! -x "$go_bin" ]] || ! go_is_compatible "$go_bin"; then
+	step "Installing the current stable Go toolchain"
+	case "$(uname -m)" in
+		x86_64) go_arch=amd64 ;;
+		aarch64 | arm64) go_arch=arm64 ;;
+		*) printf 'Unsupported architecture for Go installation: %s\n' "$(uname -m)" >&2; exit 1 ;;
+	esac
+
+	metadata="$({
+		curl -fsSL 'https://go.dev/dl/?mode=json'
+	} | python3 -c '
+import json
+import sys
+
+arch = sys.argv[1]
+for release in json.load(sys.stdin):
+    if not release.get("stable"):
+        continue
+    for artifact in release["files"]:
+        if artifact["os"] == "linux" and artifact["arch"] == arch and artifact["kind"] == "archive":
+            print(release["version"], artifact["filename"], artifact["sha256"])
+            raise SystemExit(0)
+raise SystemExit("no matching stable Go archive found")
+' "$go_arch")"
+	read -r go_version archive_name archive_sha <<<"$metadata"
+
+	install_dir="$toolchain_root/$go_version"
+	if [[ ! -x "$install_dir/bin/go" ]]; then
+		tmp_dir="$(mktemp -d)"
+		trap 'rm -rf "$tmp_dir"' EXIT
+		curl -fL "https://go.dev/dl/$archive_name" -o "$tmp_dir/$archive_name"
+		printf '%s  %s\n' "$archive_sha" "$tmp_dir/$archive_name" | sha256sum -c -
+		tar -xzf "$tmp_dir/$archive_name" -C "$tmp_dir"
+		mkdir -p "$toolchain_root"
+		mv "$tmp_dir/go" "$install_dir"
+		rm -rf "$tmp_dir"
+		trap - EXIT
+	fi
+	ln -sfn "$install_dir" "$active_toolchain"
+	go_bin="$active_toolchain/bin/go"
+fi
+
+profile_marker="# pin orb Go toolchain"
+if ! grep -Fqx "$profile_marker" "$HOME/.bash_profile" 2>/dev/null; then
+	cat >>"$HOME/.bash_profile" <<'EOF'
+
+# pin orb Go toolchain
+case ":$PATH:" in
+	*:"$HOME/.local/share/amp/toolchains/go/current/bin":*) ;;
+	*) export PATH="$HOME/.local/share/amp/toolchains/go/current/bin:$PATH" ;;
+esac
+case ":$PATH:" in
+	*:"$HOME/go/bin":*) ;;
+	*) export PATH="$HOME/go/bin:$PATH" ;;
+esac
+EOF
+fi
+
+export PATH="$active_toolchain/bin:$HOME/go/bin:$PATH"
+
+step "Downloading Go modules"
+cd "$repo_root"
+"$go_bin" mod download
+
+step "Warming the Go build cache"
+"$go_bin" test -run '^$' ./...
+
+printf '\nOrb setup complete in %ss (%s).\n' "$((SECONDS - started_at))" "$("$go_bin" env GOVERSION)"

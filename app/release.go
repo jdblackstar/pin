@@ -2,6 +2,7 @@ package app
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,12 +18,26 @@ import (
 )
 
 const (
-	metadataDir   = ".pin"
-	metadataName  = "release.json"
-	venvDir       = ".venv"
-	schemaVersion = 3
-	checkCurrent  = "current"
+	metadataDir               = ".pin"
+	metadataName              = "release.json"
+	venvDir                   = ".venv"
+	schemaVersion             = 3
+	checkCurrent              = "current"
+	releaseCommandTimeout     = 15 * time.Minute
+	releaseCommandOutputLimit = 1 << 20
+	releaseCommandWaitDelay   = time.Second
+	truncatedOutputMarker     = "[... output truncated ...]\n"
 )
+
+type commandLimits struct {
+	timeout     time.Duration
+	outputLimit int
+}
+
+var defaultCommandLimits = commandLimits{
+	timeout:     releaseCommandTimeout,
+	outputLimit: releaseCommandOutputLimit,
+}
 
 type commandResult struct {
 	args     []string
@@ -30,6 +45,54 @@ type commandResult struct {
 	stdout   string
 	stderr   string
 	exitCode int
+}
+
+type boundedBuffer struct {
+	data      []byte
+	limit     int
+	truncated bool
+}
+
+func newBoundedBuffer(limit int) *boundedBuffer {
+	if limit < 0 {
+		limit = 0
+	}
+	return &boundedBuffer{data: make([]byte, 0, limit), limit: limit}
+}
+
+func (buffer *boundedBuffer) Write(data []byte) (int, error) {
+	written := len(data)
+	if written == 0 {
+		return 0, nil
+	}
+	if buffer.limit == 0 {
+		buffer.truncated = true
+		return written, nil
+	}
+	if len(data) >= buffer.limit {
+		buffer.data = buffer.data[:buffer.limit]
+		copy(buffer.data, data[len(data)-buffer.limit:])
+		buffer.truncated = true
+		return written, nil
+	}
+	if overflow := len(buffer.data) + len(data) - buffer.limit; overflow > 0 {
+		copy(buffer.data, buffer.data[overflow:])
+		buffer.data = buffer.data[:len(buffer.data)-overflow]
+		buffer.truncated = true
+	}
+	buffer.data = append(buffer.data, data...)
+	return written, nil
+}
+
+func (buffer *boundedBuffer) String() string {
+	if !buffer.truncated {
+		return string(buffer.data)
+	}
+	if buffer.limit <= len(truncatedOutputMarker) {
+		return truncatedOutputMarker[:buffer.limit]
+	}
+	retained := buffer.limit - len(truncatedOutputMarker)
+	return truncatedOutputMarker + string(buffer.data[len(buffer.data)-retained:])
 }
 
 type releaseMetadata map[string]any
@@ -501,36 +564,62 @@ func cleanupFailedRelease(path string, cause error, removeAll func(string) error
 }
 
 func extractGitArchive(repo, sha, destination string) error {
-	archive := exec.Command("git", "archive", "--format=tar", sha)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultCommandLimits.timeout)
+	defer cancel()
+
+	archive := exec.CommandContext(ctx, "git", "archive", "--format=tar", sha)
+	configureProcessTree(archive)
+	archive.WaitDelay = releaseCommandWaitDelay
 	archive.Dir = repo
 	stdout, err := archive.StdoutPipe()
 	if err != nil {
 		return err
 	}
-	var archiveStderr bytes.Buffer
-	archive.Stderr = &archiveStderr
+	archiveStderr := newBoundedBuffer(defaultCommandLimits.outputLimit)
+	archive.Stderr = archiveStderr
 
-	extract := exec.Command("tar", "-xf", "-", "-C", destination)
+	extract := exec.CommandContext(ctx, "tar", "-xf", "-", "-C", destination)
+	configureProcessTree(extract)
+	extract.WaitDelay = releaseCommandWaitDelay
 	extract.Stdin = stdout
-	var extractStderr bytes.Buffer
-	extract.Stderr = &extractStderr
+	extractStderr := newBoundedBuffer(defaultCommandLimits.outputLimit)
+	extract.Stderr = extractStderr
 
 	if err := archive.Start(); err != nil {
 		return err
 	}
 	if err := extract.Start(); err != nil {
-		archive.Wait()
+		cancel()
+		_ = archive.Wait()
 		return err
 	}
 	extractErr := extract.Wait()
 	archiveErr := archive.Wait()
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		details := pipelineDetails(archiveStderr.String(), extractStderr.String())
+		return fmt.Errorf("git archive and tar extract timed out after %s%s", defaultCommandLimits.timeout, details)
+	}
 	if archiveErr != nil {
-		return fmt.Errorf("git archive failed: %s", strings.TrimSpace(archiveStderr.String()))
+		return fmt.Errorf("git archive failed%s", outputDetails(archiveStderr.String()))
 	}
 	if extractErr != nil {
-		return fmt.Errorf("tar extract failed: %s", strings.TrimSpace(extractStderr.String()))
+		return fmt.Errorf("tar extract failed%s", outputDetails(extractStderr.String()))
 	}
 	return nil
+}
+
+func pipelineDetails(archiveStderr, extractStderr string) string {
+	var details []string
+	if text := strings.TrimSpace(archiveStderr); text != "" {
+		details = append(details, "git: "+text)
+	}
+	if text := strings.TrimSpace(extractStderr); text != "" {
+		details = append(details, "tar: "+text)
+	}
+	if len(details) == 0 {
+		return ""
+	}
+	return ": " + strings.Join(details, "; ")
 }
 
 func ensureRuntimePathsAvailable(release string) error {
@@ -1232,8 +1321,14 @@ func compareCommits(repo, active, target string) (string, error) {
 	if active == target {
 		return checkCurrent, nil
 	}
-	activeIsAncestor := gitOK(repo, "merge-base", "--is-ancestor", active, target)
-	targetIsAncestor := gitOK(repo, "merge-base", "--is-ancestor", target, active)
+	activeIsAncestor, err := gitOK(repo, "merge-base", "--is-ancestor", active, target)
+	if err != nil {
+		return "", err
+	}
+	targetIsAncestor, err := gitOK(repo, "merge-base", "--is-ancestor", target, active)
+	if err != nil {
+		return "", err
+	}
 	if activeIsAncestor {
 		return "behind", nil
 	}
@@ -1254,10 +1349,15 @@ func fetchTargetSHA(config config) (string, error) {
 	return gitOutput(config.sourcePath, "rev-parse", branchRef(config))
 }
 
-func gitOK(cwd string, args ...string) bool {
-	command := exec.Command("git", args...)
-	command.Dir = cwd
-	return command.Run() == nil
+func gitOK(cwd string, args ...string) (bool, error) {
+	result, err := runGit(cwd, args...)
+	if err == nil {
+		return true, nil
+	}
+	if result.exitCode == 1 {
+		return false, nil
+	}
+	return false, err
 }
 
 func runGit(cwd string, args ...string) (commandResult, error) {
@@ -1273,6 +1373,10 @@ func gitOutput(cwd string, args ...string) (string, error) {
 }
 
 func runCommand(args []string, cwd string, env []string) (commandResult, error) {
+	return runCommandWithLimits(args, cwd, env, defaultCommandLimits)
+}
+
+func runCommandWithLimits(args []string, cwd string, env []string, limits commandLimits) (commandResult, error) {
 	if len(args) == 0 {
 		return commandResult{}, fmt.Errorf("empty command")
 	}
@@ -1282,14 +1386,19 @@ func runCommand(args []string, cwd string, env []string) (commandResult, error) 
 			commandArgs[0] = resolved
 		}
 	}
-	command := exec.Command(commandArgs[0], commandArgs[1:]...)
+	ctx, cancel := context.WithTimeout(context.Background(), limits.timeout)
+	defer cancel()
+	command := exec.CommandContext(ctx, commandArgs[0], commandArgs[1:]...)
+	configureProcessTree(command)
+	command.WaitDelay = releaseCommandWaitDelay
 	command.Dir = cwd
 	if env != nil {
 		command.Env = env
 	}
-	var stdout, stderr bytes.Buffer
-	command.Stdout = &stdout
-	command.Stderr = &stderr
+	stdout := newBoundedBuffer(limits.outputLimit)
+	stderr := newBoundedBuffer(limits.outputLimit)
+	command.Stdout = stdout
+	command.Stderr = stderr
 
 	err := command.Run()
 	result := commandResult{
@@ -1302,17 +1411,25 @@ func runCommand(args []string, cwd string, env []string) (commandResult, error) 
 		result.exitCode = command.ProcessState.ExitCode()
 	}
 	if err != nil {
-		details := strings.TrimSpace(stderr.String())
+		details := strings.TrimSpace(result.stderr)
 		if details == "" {
-			details = strings.TrimSpace(stdout.String())
+			details = strings.TrimSpace(result.stdout)
 		}
-		suffix := ""
-		if details != "" {
-			suffix = ": " + details
+		suffix := outputDetails(details)
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return result, fmt.Errorf("command timed out after %s in %s: %s%s", limits.timeout, cwd, quoteCommand(args), suffix)
 		}
 		return result, fmt.Errorf("command failed in %s: %s%s", cwd, quoteCommand(args), suffix)
 	}
 	return result, nil
+}
+
+func outputDetails(output string) string {
+	details := strings.TrimSpace(output)
+	if details == "" {
+		return ""
+	}
+	return ": " + details
 }
 
 func quoteCommand(args []string) string {

@@ -354,3 +354,8 @@ Candidates that are built but fail verification or activation stay in place for
 inspection. Pin attempts to clean up build-time failures. If cleanup fails, Pin
 reports the remaining path. The next update rebuilds an incomplete release only
 when it is inactive. Failed candidates are not made current.
+
+Git, environment creation, package installation, preflight, and verification
+subprocesses each have a fixed 15-minute timeout. Pin retains at most the most
+recent 1 MiB from each output stream, marking truncated output in diagnostics.
+These limits do not apply to `pin run`, which remains an interactive process.

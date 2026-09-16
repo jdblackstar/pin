@@ -446,6 +446,9 @@ func (a app) commandRun(ctx pinContext, args []string) error {
 	if err := verifyInjectedPaths(ctx, release, metadata, *config); err != nil {
 		return err
 	}
+	if err := verifyReleaseIntegrity(release, *config); err != nil {
+		return err
+	}
 	entrypoint := filepath.Join(release, venvDir, "bin", metadata.string("entrypoint"))
 	if err := requireFile(entrypoint, "missing entrypoint"); err != nil {
 		return err

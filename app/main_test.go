@@ -2,6 +2,7 @@ package app
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"os"
@@ -499,6 +500,14 @@ func requireReleaseMetadata(t *testing.T, root, sha string) {
 	if got, _ := metadata["schema_version"].(float64); got != float64(schemaVersion) {
 		t.Fatalf("metadata schema_version = %v, want %d", metadata["schema_version"], schemaVersion)
 	}
+	integrity, ok := metadata["integrity"].(map[string]any)
+	digest, digestOK := integrity["manifest_sha256"].(string)
+	if !ok || !digestOK || integrity["algorithm"] != integrityAlgorithm || len(digest) != sha256.Size*2 {
+		t.Fatalf("metadata integrity is missing or invalid: %#v", metadata["integrity"])
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(path), integrityName)); err != nil {
+		t.Fatalf("release integrity manifest is missing: %v", err)
+	}
 }
 
 func requireNoTemporaryReleaseDirs(t *testing.T, root string) {
@@ -543,11 +552,31 @@ func setReleaseVerifyToFailWhenActive(t *testing.T, metadataPath, currentLink, m
 		t.Fatalf("metadata config is missing or invalid: %#v", metadata["config"])
 	}
 	config["verify"] = [][]string{{"python3", "-c", activeVerificationScript(currentLink, message)}}
-	data, err := json.MarshalIndent(metadata, "", "  ")
+	manifestPath := filepath.Join(filepath.Dir(metadataPath), integrityName)
+	var manifest integrityManifest
+	if err := json.Unmarshal([]byte(mustReadFile(t, manifestPath)), &manifest); err != nil {
+		t.Fatal(err)
+	}
+	metadataDigest, err := hashMetadataPayload(releaseMetadata(metadata))
 	if err != nil {
 		t.Fatal(err)
 	}
-	writeFile(t, metadataPath, string(data)+"\n")
+	manifest.MetadataSHA256 = metadataDigest
+	if err := atomicWriteJSON(manifestPath, manifest); err != nil {
+		t.Fatal(err)
+	}
+	manifestDigest, err := hashFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	integrity, ok := metadata["integrity"].(map[string]any)
+	if !ok {
+		t.Fatalf("metadata integrity is missing or invalid: %#v", metadata["integrity"])
+	}
+	integrity["manifest_sha256"] = manifestDigest
+	if err := atomicWriteJSON(metadataPath, metadata); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestUpdateStatusVerifyAndList(t *testing.T) {
@@ -1122,6 +1151,200 @@ func TestRunExecutesActiveRelease(t *testing.T) {
 	if strings.TrimSpace(result.stdout) != "demo 1" {
 		t.Fatalf("run stdout = %q, want demo 1", result.stdout)
 	}
+}
+
+func TestIntegrityDetectsArchivedSourceMutationBeforeUseOrReuse(t *testing.T) {
+	root := t.TempDir()
+	repo, sha := sourceRepo(t, root)
+	result := runTool(t, runPin, root, repo, "update")
+	requireCode(t, result, 0)
+
+	release := filepath.Join(root, "share", "demo-tool", "releases", sha)
+	replaceInFile(t, filepath.Join(release, "demo_tool.py"), "demo 1", "demo 9")
+
+	for _, command := range [][]string{{"verify", "demo-tool"}, {"run", "demo-tool"}, {"update", repo}} {
+		result = runPin(t, root, command...)
+		requireCode(t, result, 2)
+		requireContains(t, result.stderr, "release integrity mismatch: content changed for demo_tool.py")
+	}
+}
+
+func TestIntegrityDetectsEntrypointMutationBeforeRun(t *testing.T) {
+	root := t.TempDir()
+	repo, sha := sourceRepo(t, root)
+	result := runTool(t, runPin, root, repo, "update")
+	requireCode(t, result, 0)
+
+	entrypoint := filepath.Join(root, "share", "demo-tool", "releases", sha, venvDir, "bin", "demo-tool")
+	writeFile(t, entrypoint, "#!/bin/sh\necho tampered\n")
+	result = runPin(t, root, "run", "demo-tool")
+	requireCode(t, result, 2)
+	requireContains(t, result.stderr, "release integrity mismatch: content changed for .venv/bin/demo-tool")
+	if strings.Contains(result.stdout, "tampered") {
+		t.Fatalf("tampered entrypoint ran before integrity verification: %s", result.stdout)
+	}
+}
+
+func TestIntegrityDetectsInstalledVirtualenvMutation(t *testing.T) {
+	root := t.TempDir()
+	repo, sha := sourceRepo(t, root)
+	result := runTool(t, runPin, root, repo, "update")
+	requireCode(t, result, 0)
+
+	release := filepath.Join(root, "share", "demo-tool", "releases", sha)
+	matches, err := filepath.Glob(filepath.Join(release, venvDir, "lib", "python*", "site-packages", "demo_tool.py"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("installed demo_tool.py matches = %v, want one", matches)
+	}
+	replaceInFile(t, matches[0], "demo 1", "demo 9")
+
+	result = runPin(t, root, "verify", "demo-tool")
+	requireCode(t, result, 2)
+	requireContains(t, result.stderr, "release integrity mismatch: content changed for .venv/")
+	requireContains(t, result.stderr, "/site-packages/demo_tool.py")
+}
+
+func TestIntegrityDetectsUnexpectedReleaseContentAndMetadataMutation(t *testing.T) {
+	t.Run("unexpected content", func(t *testing.T) {
+		root := t.TempDir()
+		repo, sha := sourceRepo(t, root)
+		result := runTool(t, runPin, root, repo, "update")
+		requireCode(t, result, 0)
+
+		release := filepath.Join(root, "share", "demo-tool", "releases", sha)
+		writeFile(t, filepath.Join(release, "unexpected.py"), "print('extra')\n")
+		result = runPin(t, root, "verify", "demo-tool")
+		requireCode(t, result, 2)
+		requireContains(t, result.stderr, "release integrity mismatch: unexpected unexpected.py")
+	})
+
+	t.Run("metadata", func(t *testing.T) {
+		root := t.TempDir()
+		repo, sha := sourceRepo(t, root)
+		result := runTool(t, runPin, root, repo, "update")
+		requireCode(t, result, 0)
+
+		metadataPath := filepath.Join(root, "share", "demo-tool", "releases", sha, metadataDir, metadataName)
+		var metadata map[string]any
+		if err := json.Unmarshal([]byte(mustReadFile(t, metadataPath)), &metadata); err != nil {
+			t.Fatal(err)
+		}
+		metadata["installed_at"] = "2000-01-01T00:00:00Z"
+		data, err := json.MarshalIndent(metadata, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		writeFile(t, metadataPath, string(data)+"\n")
+
+		result = runPin(t, root, "verify", "demo-tool")
+		requireCode(t, result, 2)
+		requireContains(t, result.stderr, "release metadata digest changed")
+	})
+}
+
+func TestIntegrityExcludesRuntimeCaches(t *testing.T) {
+	root := t.TempDir()
+	repo, sha := sourceRepo(t, root)
+	result := runTool(t, runPin, root, repo, "update")
+	requireCode(t, result, 0)
+
+	release := filepath.Join(root, "share", "demo-tool", "releases", sha)
+	writeFile(t, filepath.Join(release, ".cache", "tool", "state"), "mutable\n")
+	writeFile(t, filepath.Join(release, "__pycache__", "demo.cpython-313.pyc"), "mutable\n")
+	sitePackages, err := filepath.Glob(filepath.Join(release, venvDir, "lib", "python*", "site-packages"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sitePackages) != 1 {
+		t.Fatalf("site-packages matches = %v, want one", sitePackages)
+	}
+	writeFile(t, filepath.Join(sitePackages[0], "__pycache__", "module.pyc"), "mutable\n")
+
+	result = runPin(t, root, "verify", "demo-tool")
+	requireCode(t, result, 0)
+}
+
+func TestVerifyRejectsCommandThatMutatesProtectedReleaseContent(t *testing.T) {
+	root := t.TempDir()
+	repo, _ := sourceRepo(t, root)
+	replaceInFile(
+		t,
+		filepath.Join(repo, "pin.toml"),
+		`verify = ["demo-tool"]`,
+		`verify = [["python3", "-c", "from pathlib import Path; Path('demo_tool.py').write_text('tampered')"]]`,
+	)
+	git(t, repo, "add", "pin.toml")
+	git(t, repo, "commit", "-m", "add mutating verifier")
+	git(t, repo, "push")
+
+	result := runTool(t, runPin, root, repo, "update")
+	requireCode(t, result, 2)
+	requireContains(t, result.stderr, "recheck release integrity")
+	requireContains(t, result.stderr, "release integrity mismatch: content changed for demo_tool.py")
+	if _, err := os.Lstat(filepath.Join(root, "share", "demo-tool", "current")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("mutated candidate was activated: %v", err)
+	}
+}
+
+func TestVerifyRechecksMetadataAfterCommand(t *testing.T) {
+	root := t.TempDir()
+	repo, _ := sourceRepo(t, root)
+	script, err := json.Marshal("import json; from pathlib import Path; p = Path('.pin/release.json'); data = json.loads(p.read_text()); data['installed_at'] = '2000-01-01T00:00:00Z'; p.write_text(json.dumps(data))")
+	if err != nil {
+		t.Fatal(err)
+	}
+	replaceInFile(
+		t,
+		filepath.Join(repo, "pin.toml"),
+		`verify = ["demo-tool"]`,
+		`verify = [["python3", "-c", `+string(script)+`]]`,
+	)
+	git(t, repo, "add", "pin.toml")
+	git(t, repo, "commit", "-m", "add metadata mutating verifier")
+	git(t, repo, "push")
+
+	result := runTool(t, runPin, root, repo, "update")
+	requireCode(t, result, 2)
+	requireContains(t, result.stderr, "recheck release integrity")
+	requireContains(t, result.stderr, "release metadata digest changed")
+	if _, err := os.Lstat(filepath.Join(root, "share", "demo-tool", "current")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("metadata-mutated candidate was activated: %v", err)
+	}
+}
+
+func TestReleaseWithoutIntegrityFailsClosedUntilRebuilt(t *testing.T) {
+	root := t.TempDir()
+	repo, sha := sourceRepo(t, root)
+	result := runTool(t, runPin, root, repo, "update")
+	requireCode(t, result, 0)
+
+	metadataPath := filepath.Join(root, "share", "demo-tool", "releases", sha, metadataDir, metadataName)
+	var metadata map[string]any
+	if err := json.Unmarshal([]byte(mustReadFile(t, metadataPath)), &metadata); err != nil {
+		t.Fatal(err)
+	}
+	delete(metadata, "integrity")
+	data, err := json.MarshalIndent(metadata, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, metadataPath, string(data)+"\n")
+
+	for _, command := range [][]string{{"verify", "demo-tool"}, {"run", "demo-tool"}, {"update", repo}} {
+		result = runPin(t, root, command...)
+		requireCode(t, result, 2)
+		requireContains(t, result.stderr, "release has no integrity manifest")
+		requireContains(t, result.stderr, "clean source revision")
+	}
+
+	newSHA := commitToolVersion(t, repo, "2", false)
+	git(t, repo, "push")
+	result = runTool(t, runPin, root, repo, "update")
+	requireCode(t, result, 0)
+	requireContains(t, result.stdout, newSHA)
 }
 
 func TestRunResolvesToolNameBeforeLocalPath(t *testing.T) {

@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -20,6 +22,7 @@ import (
 const (
 	metadataDir               = ".pin"
 	metadataName              = "release.json"
+	integrityName             = "integrity.json"
 	venvDir                   = ".venv"
 	schemaVersion             = 3
 	checkCurrent              = "current"
@@ -38,6 +41,8 @@ var defaultCommandLimits = commandLimits{
 	timeout:     releaseCommandTimeout,
 	outputLimit: releaseCommandOutputLimit,
 }
+
+const integrityAlgorithm = "sha256"
 
 type commandResult struct {
 	args     []string
@@ -99,6 +104,24 @@ func (buffer *boundedBuffer) String() string {
 }
 
 type releaseMetadata map[string]any
+
+type integrityReference struct {
+	Algorithm      string `json:"algorithm"`
+	ManifestSHA256 string `json:"manifest_sha256"`
+}
+
+type integrityManifest struct {
+	Version        int              `json:"version"`
+	MetadataSHA256 string           `json:"metadata_sha256"`
+	Entries        []integrityEntry `json:"entries"`
+}
+
+type integrityEntry struct {
+	Path   string `json:"path"`
+	Type   string `json:"type"`
+	Mode   string `json:"mode"`
+	SHA256 string `json:"sha256,omitempty"`
+}
 
 func (m releaseMetadata) string(key string) string {
 	value, _ := m[key].(string)
@@ -233,11 +256,150 @@ func writeReleaseMetadata(release, metadataReleasePath string, config config, sh
 		"release_path":   metadataReleasePath,
 		"config":         config.raw,
 	}
+	manifest, err := buildIntegrityManifest(release, metadata, config)
+	if err != nil {
+		return err
+	}
 	metadataPath := filepath.Join(release, metadataDir, metadataName)
 	if err := os.MkdirAll(filepath.Dir(metadataPath), 0o755); err != nil {
 		return err
 	}
+	manifestPath := filepath.Join(release, metadataDir, integrityName)
+	if err := atomicWriteJSON(manifestPath, manifest); err != nil {
+		return err
+	}
+	manifestDigest, err := hashFile(manifestPath)
+	if err != nil {
+		return err
+	}
+	metadata["integrity"] = integrityReference{
+		Algorithm:      integrityAlgorithm,
+		ManifestSHA256: manifestDigest,
+	}
 	return atomicWriteJSON(metadataPath, metadata)
+}
+
+func buildIntegrityManifest(release string, metadata releaseMetadata, config config) (integrityManifest, error) {
+	metadataDigest, err := hashMetadataPayload(metadata)
+	if err != nil {
+		return integrityManifest{}, err
+	}
+	entries, err := collectIntegrityEntries(release, config)
+	if err != nil {
+		return integrityManifest{}, err
+	}
+	return integrityManifest{
+		Version:        1,
+		MetadataSHA256: metadataDigest,
+		Entries:        entries,
+	}, nil
+}
+
+func hashMetadataPayload(metadata releaseMetadata) (string, error) {
+	payload := make(releaseMetadata, len(metadata))
+	for key, value := range metadata {
+		if key != "integrity" {
+			payload[key] = value
+		}
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	return hashBytes(data), nil
+}
+
+func collectIntegrityEntries(release string, config config) ([]integrityEntry, error) {
+	var entries []integrityEntry
+	err := filepath.WalkDir(release, func(filePath string, dirEntry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, err := filepath.Rel(release, filePath)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+		if integrityPathExcluded(rel, config) {
+			if dirEntry.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		entry, err := integrityEntryForPath(filePath, rel, dirEntry)
+		if err != nil {
+			return err
+		}
+		entries = append(entries, entry)
+		return nil
+	})
+	return entries, err
+}
+
+func integrityPathExcluded(rel string, config config) bool {
+	rel = filepath.ToSlash(rel)
+	if rel == metadataDir || strings.HasPrefix(rel, metadataDir+"/") ||
+		rel == ".cache" || strings.HasPrefix(rel, ".cache/") {
+		return true
+	}
+	for _, injected := range config.inject {
+		injected = filepath.ToSlash(injected)
+		if rel == injected || strings.HasPrefix(rel, injected+"/") {
+			return true
+		}
+	}
+	for _, part := range strings.Split(rel, "/") {
+		if part == "__pycache__" {
+			return true
+		}
+	}
+	return strings.HasSuffix(rel, ".pyc") || strings.HasSuffix(rel, ".pyo")
+}
+
+func integrityEntryForPath(filePath, rel string, dirEntry os.DirEntry) (integrityEntry, error) {
+	info, err := dirEntry.Info()
+	if err != nil {
+		return integrityEntry{}, err
+	}
+	entry := integrityEntry{
+		Path: filepath.ToSlash(rel),
+		Mode: fmt.Sprintf("%04o", info.Mode().Perm()),
+	}
+	switch {
+	case info.Mode().IsRegular():
+		entry.Type = "file"
+		entry.SHA256, err = hashFile(filePath)
+	case info.IsDir():
+		entry.Type = "directory"
+	case info.Mode()&os.ModeSymlink != 0:
+		entry.Type = "symlink"
+		var target string
+		target, err = os.Readlink(filePath)
+		entry.SHA256 = hashBytes([]byte(target))
+	default:
+		err = fmt.Errorf("unsupported release file type: %s", filePath)
+	}
+	return entry, err
+}
+
+func hashFile(filePath string) (string, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", hash.Sum(nil)), nil
+}
+
+func hashBytes(data []byte) string {
+	digest := sha256.Sum256(data)
+	return fmt.Sprintf("%x", digest)
 }
 
 func atomicWriteJSON(path string, payload any) error {
@@ -412,6 +574,9 @@ func ensureRelease(ctx pinContext, config config, sha string) (string, error) {
 		return "", fmt.Errorf("existing release %s cannot be safely reused: %w", release, err)
 	}
 	if sameConfig(config, *storedConfig) {
+		if err := verifyReleaseIntegrity(release, *storedConfig); err != nil {
+			return "", fmt.Errorf("existing release %s cannot be safely reused: %w", release, err)
+		}
 		return release, nil
 	}
 
@@ -1036,6 +1201,7 @@ func verifyRelease(ctx pinContext, release string, expectActive bool) error {
 		releaseStep{"validate metadata", func() error { return validateMetadata(ctx, release, metadata, *config) }},
 		releaseStep{"check injected paths", func() error { return verifyInjectedPaths(ctx, release, metadata, *config) }},
 		releaseStep{"check entrypoint", func() error { return requireFile(entrypoint, "missing entrypoint") }},
+		releaseStep{"check release integrity", func() error { return verifyReleaseIntegrity(release, *config) }},
 		releaseStep{"check active link", func() error {
 			if !expectActive {
 				return nil
@@ -1045,7 +1211,124 @@ func verifyRelease(ctx pinContext, release string, expectActive bool) error {
 		releaseStep{"run verify commands", func() error {
 			return runConfiguredCommands(config.verify, release, entrypointEnv(entrypoint))
 		}},
+		releaseStep{"recheck release integrity", func() error { return verifyReleaseIntegrity(release, *config) }},
 	)
+}
+
+func verifyReleaseIntegrity(release string, config config) error {
+	metadata, err := readReleaseMetadata(release)
+	if err != nil {
+		return err
+	}
+	reference, err := parseIntegrityReference(metadata)
+	if err != nil {
+		return err
+	}
+	manifestPath := filepath.Join(release, metadataDir, integrityName)
+	manifestData, err := os.ReadFile(manifestPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("release integrity manifest is missing: %s", manifestPath)
+	}
+	if err != nil {
+		return err
+	}
+	if actual := hashBytes(manifestData); actual != reference.ManifestSHA256 {
+		return fmt.Errorf("release integrity manifest digest changed: %s", manifestPath)
+	}
+
+	var manifest integrityManifest
+	if err := json.Unmarshal(manifestData, &manifest); err != nil {
+		return fmt.Errorf("invalid release integrity manifest: %s: %w", manifestPath, err)
+	}
+	if manifest.Version != 1 {
+		return fmt.Errorf("unsupported release integrity manifest version: %d", manifest.Version)
+	}
+	metadataDigest, err := hashMetadataPayload(metadata)
+	if err != nil {
+		return err
+	}
+	if metadataDigest != manifest.MetadataSHA256 {
+		return fmt.Errorf("release metadata digest changed: %s", filepath.Join(release, metadataDir, metadataName))
+	}
+	actual, err := collectIntegrityEntries(release, config)
+	if err != nil {
+		return err
+	}
+	return compareIntegrityEntries(manifest.Entries, actual)
+}
+
+func parseIntegrityReference(metadata releaseMetadata) (integrityReference, error) {
+	raw, ok := metadata["integrity"]
+	if !ok {
+		return integrityReference{}, fmt.Errorf("release has no integrity manifest; commit a new clean source revision and run pin update")
+	}
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return integrityReference{}, err
+	}
+	var reference integrityReference
+	if err := json.Unmarshal(data, &reference); err != nil {
+		return integrityReference{}, fmt.Errorf("invalid release integrity metadata: %w", err)
+	}
+	if reference.Algorithm != integrityAlgorithm || len(reference.ManifestSHA256) != sha256.Size*2 {
+		return integrityReference{}, fmt.Errorf("invalid release integrity metadata")
+	}
+	return reference, nil
+}
+
+func compareIntegrityEntries(expected, actual []integrityEntry) error {
+	expectedByPath := make(map[string]integrityEntry, len(expected))
+	for _, entry := range expected {
+		if !validIntegrityEntry(entry) {
+			return fmt.Errorf("invalid release integrity entry: %q", entry.Path)
+		}
+		if _, exists := expectedByPath[entry.Path]; exists {
+			return fmt.Errorf("duplicate release integrity entry: %s", entry.Path)
+		}
+		expectedByPath[entry.Path] = entry
+	}
+	actualByPath := make(map[string]integrityEntry, len(actual))
+	for _, entry := range actual {
+		actualByPath[entry.Path] = entry
+	}
+	for _, wanted := range expected {
+		got, exists := actualByPath[wanted.Path]
+		if !exists {
+			return fmt.Errorf("release integrity mismatch: missing %s", wanted.Path)
+		}
+		if got.Type != wanted.Type {
+			return fmt.Errorf("release integrity mismatch: type changed for %s", wanted.Path)
+		}
+		if got.Mode != wanted.Mode {
+			return fmt.Errorf("release integrity mismatch: mode changed for %s", wanted.Path)
+		}
+		if got.SHA256 != wanted.SHA256 {
+			return fmt.Errorf("release integrity mismatch: content changed for %s", wanted.Path)
+		}
+		delete(actualByPath, wanted.Path)
+	}
+	for _, entry := range actual {
+		if _, exists := actualByPath[entry.Path]; exists {
+			return fmt.Errorf("release integrity mismatch: unexpected %s", entry.Path)
+		}
+	}
+	return nil
+}
+
+func validIntegrityEntry(entry integrityEntry) bool {
+	if entry.Path == "" || entry.Path != path.Clean(entry.Path) || path.IsAbs(entry.Path) || entry.Path == ".." || strings.HasPrefix(entry.Path, "../") {
+		return false
+	}
+	if entry.Type != "file" && entry.Type != "directory" && entry.Type != "symlink" {
+		return false
+	}
+	if len(entry.Mode) != 4 {
+		return false
+	}
+	if entry.Type == "directory" {
+		return entry.SHA256 == ""
+	}
+	return len(entry.SHA256) == sha256.Size*2
 }
 
 func verifyInjectedPaths(ctx pinContext, release string, metadata releaseMetadata, config config) error {
@@ -1349,6 +1632,23 @@ func activateRelease(ctx pinContext, sha string) error {
 	}
 	if !exists {
 		return fmt.Errorf("cannot activate missing release: %s", target)
+	}
+	metadata, err := readReleaseMetadata(target)
+	if err != nil {
+		return err
+	}
+	config, err := loadConfigFromMetadata(metadata)
+	if err != nil {
+		return err
+	}
+	if err := validateMetadata(ctx, target, metadata, *config); err != nil {
+		return err
+	}
+	if err := verifyInjectedPaths(ctx, target, metadata, *config); err != nil {
+		return err
+	}
+	if err := verifyReleaseIntegrity(target, *config); err != nil {
+		return err
 	}
 
 	oldTarget, hadOldTarget, err := releaseSymlink(ctx, ctx.currentLink())

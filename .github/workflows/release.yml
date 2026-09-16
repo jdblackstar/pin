@@ -6,13 +6,36 @@ on:
       - "v*"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   quality:
     name: quality gates
     runs-on: ubuntu-latest
+    outputs:
+      release_ref: ${{ steps.release_ref.outputs.value }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - name: Validate release ref
+        id: release_ref
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -euo pipefail
+          semver='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*)|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.((0|[1-9][0-9]*)|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+          if [[ "$REF_TYPE" == "tag" ]]; then
+            if [[ ! "$REF_NAME" =~ $semver ]]; then
+              echo "::error::Release tags must use strict SemVer format (for example, v1.2.3 or v1.2.3-rc.1)."
+              exit 1
+            fi
+          elif [[ ! "$REF_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+            echo "::error::Manual build refs must contain only letters, numbers, dots, underscores, and hyphens."
+            exit 1
+          fi
+          printf 'value=%s\n' "$REF_NAME" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: stable
       - name: Test
@@ -35,8 +58,8 @@ jobs:
             goos: darwin
             goarch: amd64
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: stable
       - name: Build
@@ -44,16 +67,18 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: "0"
+          RELEASE_REF: ${{ needs.quality.outputs.release_ref }}
         run: |
           mkdir -p dist
-          version="${GITHUB_REF_NAME#v}"
+          version="${RELEASE_REF#v}"
           go build -trimpath -ldflags "-s -w -X github.com/jdblackstar/pin/app.version=${version}" -o "dist/pin" .
       - name: Package
+        env:
+          RELEASE_REF: ${{ needs.quality.outputs.release_ref }}
+          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          version="${{ github.ref_name }}"
-          target="${{ matrix.target }}"
-          archive="pin_${version}_${target}.tar.gz"
+          archive="pin_${RELEASE_REF}_${TARGET}.tar.gz"
           tar -C dist -czf "${archive}" pin
           ARCHIVE="${archive}" python3 - <<'PY'
           import hashlib
@@ -65,12 +90,12 @@ jobs:
           out = archive.with_name(archive.name + ".sha256")
           out.write_text(f"{digest}  {archive.name}\n")
           PY
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.target }}
           path: |
-            pin_${{ github.ref_name }}_${{ matrix.target }}.tar.gz
-            pin_${{ github.ref_name }}_${{ matrix.target }}.tar.gz.sha256
+            pin_${{ needs.quality.outputs.release_ref }}_${{ matrix.target }}.tar.gz
+            pin_${{ needs.quality.outputs.release_ref }}_${{ matrix.target }}.tar.gz.sha256
 
   build-linux:
     name: linux ${{ matrix.target }}
@@ -87,8 +112,8 @@ jobs:
             goos: linux
             goarch: arm64
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: stable
       - name: Build
@@ -96,16 +121,18 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: "0"
+          RELEASE_REF: ${{ needs.quality.outputs.release_ref }}
         run: |
           mkdir -p dist
-          version="${GITHUB_REF_NAME#v}"
+          version="${RELEASE_REF#v}"
           go build -trimpath -ldflags "-s -w -X github.com/jdblackstar/pin/app.version=${version}" -o "dist/pin" .
       - name: Package
+        env:
+          RELEASE_REF: ${{ needs.quality.outputs.release_ref }}
+          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          version="${{ github.ref_name }}"
-          target="${{ matrix.target }}"
-          archive="pin_${version}_${target}.tar.gz"
+          archive="pin_${RELEASE_REF}_${TARGET}.tar.gz"
           tar -C dist -czf "${archive}" pin
           ARCHIVE="${archive}" python3 - <<'PY'
           import hashlib
@@ -117,30 +144,31 @@ jobs:
           out = archive.with_name(archive.name + ".sha256")
           out.write_text(f"{digest}  {archive.name}\n")
           PY
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.target }}
           path: |
-            pin_${{ github.ref_name }}_${{ matrix.target }}.tar.gz
-            pin_${{ github.ref_name }}_${{ matrix.target }}.tar.gz.sha256
+            pin_${{ needs.quality.outputs.release_ref }}_${{ matrix.target }}.tar.gz
+            pin_${{ needs.quality.outputs.release_ref }}_${{ matrix.target }}.tar.gz.sha256
 
   release:
     name: publish
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     needs:
+      - quality
       - build-macos
       - build-linux
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
       - name: Publish release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ needs.quality.outputs.release_ref }}
           generate_release_notes: true
           files: |
             dist/**/pin_*.tar.gz*

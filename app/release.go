@@ -549,6 +549,11 @@ func ensureRuntimePathsAvailable(release string) error {
 }
 
 func injectRuntimePaths(ctx pinContext, releaseSource string, config config) error {
+	if len(config.inject) != 0 {
+		if err := prepareInjectedSharedRoot(ctx.sharedDir()); err != nil {
+			return err
+		}
+	}
 	for _, path := range config.inject {
 		backing := ctx.sharedPath(path)
 		if err := ensureInjectTargetAvailable(releaseSource, path); err != nil {
@@ -624,7 +629,7 @@ func ensureInjectedBackingPath(backing, source string) error {
 		return fmt.Errorf("injected source path is a symlink: %s", source)
 	}
 
-	if err := os.MkdirAll(filepath.Dir(backing), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(backing), 0o700); err != nil {
 		return err
 	}
 	tmp := filepath.Join(filepath.Dir(backing), fmt.Sprintf(".%s.%d.tmp", filepath.Base(backing), os.Getpid()))
@@ -635,7 +640,7 @@ func ensureInjectedBackingPath(backing, source string) error {
 			return err
 		}
 	} else {
-		if err := copyRegularFile(tmp, source, sourceInfo.Mode().Perm()); err != nil {
+		if err := copyRegularFile(tmp, source, privateInjectedMode(sourceInfo.Mode())); err != nil {
 			_ = os.RemoveAll(tmp)
 			return err
 		}
@@ -665,13 +670,17 @@ func copyDirectory(destination, source string) error {
 		}
 		target := filepath.Join(destination, rel)
 		if entry.IsDir() {
-			return os.MkdirAll(target, info.Mode().Perm())
+			return os.MkdirAll(target, privateInjectedMode(info.Mode()))
 		}
 		if !info.Mode().IsRegular() {
 			return fmt.Errorf("injected source path contains unsupported file: %s", path)
 		}
-		return copyRegularFile(target, path, info.Mode().Perm())
+		return copyRegularFile(target, path, privateInjectedMode(info.Mode()))
 	})
+}
+
+func privateInjectedMode(mode os.FileMode) os.FileMode {
+	return mode.Perm() & 0o700
 }
 
 func copyRegularFile(destination, source string, mode os.FileMode) error {

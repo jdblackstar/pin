@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$repo_root/.agents/go-toolchain.env"
+
+tmp_root="$(mktemp -d)"
+trap 'rm -rf "$tmp_root"' EXIT
+mock_bin="$tmp_root/bin"
+mkdir -p "$mock_bin"
+
+fail() {
+	printf 'FAIL: %s\n' "$1" >&2
+	exit 1
+}
+
+cat >"$mock_bin/uname" <<'EOF'
+#!/bin/sh
+if [ "${1-}" = "-m" ]; then
+	printf '%s\n' "$TEST_UNAME"
+else
+	/usr/bin/uname "$@"
+fi
+EOF
+
+cat >"$mock_bin/curl" <<'EOF'
+#!/bin/sh
+output=
+url=
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+		-o) output=$2; shift 2 ;;
+		https://*) url=$1; shift ;;
+		*) shift ;;
+	esac
+done
+[ -n "$output" ] && [ -n "$url" ]
+printf '%s\n' "$url" >>"$TEST_LOG/curl"
+: >"$output"
+EOF
+
+cat >"$mock_bin/sha256sum" <<'EOF'
+#!/bin/sh
+IFS= read -r input
+actual=${input%% *}
+[ "$actual" = "$TEST_EXPECTED_SHA" ] || {
+	printf 'unexpected checksum: %s\n' "$actual" >&2
+	exit 1
+}
+printf '%s\n' "$input" >>"$TEST_LOG/checksum"
+printf '%s: OK\n' "${input#*  }"
+EOF
+
+cat >"$mock_bin/tar" <<'EOF'
+#!/bin/sh
+destination=
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+		-C) destination=$2; shift 2 ;;
+		*) shift ;;
+	esac
+done
+[ -n "$destination" ]
+mkdir -p "$destination/go/bin"
+cat >"$destination/go/bin/go" <<SCRIPT
+#!/bin/sh
+if [ "\${1-}" = "env" ] && [ "\${2-}" = "GOVERSION" ]; then
+	printf '%s\\n' '$TEST_GO_VERSION'
+elif [ "\${1-}" = "version" ]; then
+	printf 'go version %s linux/amd64\\n' '$TEST_GO_VERSION'
+fi
+exit 0
+SCRIPT
+chmod +x "$destination/go/bin/go"
+EOF
+chmod +x "$mock_bin"/*
+
+run_setup() {
+	local home=$1
+	local machine=$2
+	local expected_sha=$3
+	mkdir -p "$home" "$home/test-log"
+	HOME="$home" \
+		PATH="$mock_bin:/usr/bin:/bin" \
+		TEST_UNAME="$machine" \
+		TEST_EXPECTED_SHA="$expected_sha" \
+		TEST_GO_VERSION="$GO_VERSION" \
+		TEST_LOG="$home/test-log" \
+		"$repo_root/.agents/setup" >"$home/setup-output"
+}
+
+assert_selected_profile() {
+	local home=$1
+	local selected=$2
+	local profile
+	for profile in .bash_profile .bash_login .profile; do
+		if [[ "$profile" == "$selected" ]]; then
+			[[ "$(grep -Fxc '# pin orb Go toolchain' "$home/$profile")" == 1 ]] || fail "$profile was not updated exactly once"
+		elif [[ -e "$home/$profile" ]] && grep -Fqx '# pin orb Go toolchain' "$home/$profile"; then
+			fail "$profile was updated instead of $selected"
+		fi
+	done
+}
+
+assert_download() {
+	local home=$1
+	local arch=$2
+	local expected_sha=$3
+	[[ "$(tail -n 1 "$home/test-log/curl")" == "https://go.dev/dl/$GO_VERSION.linux-$arch.tar.gz" ]] || fail "wrong $arch archive URL"
+	[[ "$(tail -n 1 "$home/test-log/checksum")" == "$expected_sha  "* ]] || fail "wrong $arch checksum"
+}
+
+profile_home="$tmp_root/profile-home"
+mkdir -p "$profile_home"
+printf 'export PIN_PROFILE_SENTINEL=preserved\n' >"$profile_home/.profile"
+run_setup "$profile_home" x86_64 "$GO_LINUX_AMD64_SHA256"
+[[ ! -e "$profile_home/.bash_profile" && ! -e "$profile_home/.bash_login" ]] || fail '.profile was shadowed'
+grep -Fqx 'export PIN_PROFILE_SENTINEL=preserved' "$profile_home/.profile" || fail '.profile contents were not preserved'
+assert_selected_profile "$profile_home" .profile
+assert_download "$profile_home" amd64 "$GO_LINUX_AMD64_SHA256"
+
+login_home="$tmp_root/login-home"
+mkdir -p "$login_home"
+printf 'login sentinel\n' >"$login_home/.bash_login"
+printf 'profile sentinel\n' >"$login_home/.profile"
+run_setup "$login_home" aarch64 "$GO_LINUX_ARM64_SHA256"
+assert_selected_profile "$login_home" .bash_login
+assert_download "$login_home" arm64 "$GO_LINUX_ARM64_SHA256"
+
+bash_profile_home="$tmp_root/bash-profile-home"
+mkdir -p "$bash_profile_home"
+printf 'bash profile sentinel\n' >"$bash_profile_home/.bash_profile"
+printf 'login sentinel\n' >"$bash_profile_home/.bash_login"
+printf 'profile sentinel\n' >"$bash_profile_home/.profile"
+run_setup "$bash_profile_home" arm64 "$GO_LINUX_ARM64_SHA256"
+assert_selected_profile "$bash_profile_home" .bash_profile
+
+empty_home="$tmp_root/empty-home"
+run_setup "$empty_home" x86_64 "$GO_LINUX_AMD64_SHA256"
+assert_selected_profile "$empty_home" .bash_profile
+
+downloads_before="$(wc -l <"$profile_home/test-log/curl")"
+run_setup "$profile_home" x86_64 "$GO_LINUX_AMD64_SHA256"
+[[ "$(wc -l <"$profile_home/test-log/curl")" == "$downloads_before" ]] || fail 'warm setup downloaded Go again'
+assert_selected_profile "$profile_home" .profile
+
+toolchain_root="$profile_home/.local/share/amp/toolchains/go"
+install_dir="$toolchain_root/$GO_VERSION"
+printf '#!/bin/sh\nexit 1\n' >"$install_dir/bin/go"
+chmod +x "$install_dir/bin/go"
+run_setup "$profile_home" x86_64 "$GO_LINUX_AMD64_SHA256"
+[[ "$(wc -l <"$profile_home/test-log/curl")" == "$((downloads_before + 1))" ]] || fail 'corrupt toolchain was not replaced'
+HOME="$profile_home" "$repo_root/.agents/resume"
+
+cat >"$install_dir/bin/go" <<'EOF'
+#!/bin/sh
+if [ "${1-}" = "env" ]; then printf '%s\n' go1.24.0; fi
+exit 0
+EOF
+chmod +x "$install_dir/bin/go"
+if HOME="$profile_home" "$repo_root/.agents/resume" 2>/dev/null; then
+	fail 'resume accepted the wrong Go version'
+fi
+run_setup "$profile_home" x86_64 "$GO_LINUX_AMD64_SHA256"
+[[ "$(wc -l <"$profile_home/test-log/curl")" == "$((downloads_before + 2))" ]] || fail 'wrong-version toolchain was not replaced'
+
+mkdir -p "$toolchain_root/other/bin"
+cp "$install_dir/bin/go" "$toolchain_root/other/bin/go"
+rm "$toolchain_root/current"
+ln -s "$toolchain_root/other" "$toolchain_root/current"
+if HOME="$profile_home" "$repo_root/.agents/resume" 2>/dev/null; then
+	fail 'resume accepted a current link to an unpinned directory'
+fi
+run_setup "$profile_home" x86_64 "$GO_LINUX_AMD64_SHA256"
+[[ "$(readlink "$toolchain_root/current")" == "$install_dir" ]] || fail 'setup did not restore the current link'
+[[ "$(wc -l <"$profile_home/test-log/curl")" == "$((downloads_before + 2))" ]] || fail 'relinking downloaded an already healthy toolchain'
+HOME="$profile_home" "$repo_root/.agents/resume"
+
+login_state="$(env -i HOME="$profile_home" PATH=/usr/bin:/bin /bin/bash --login -c 'printf "%s|%s\n" "${PIN_PROFILE_SENTINEL-}" "$(command -v go)"')"
+[[ "$login_state" == "preserved|$profile_home/.local/share/amp/toolchains/go/current/bin/go" ]] || fail 'clean login shell did not preserve profile state and activate pinned Go'
+
+printf 'setup regression checks passed\n'

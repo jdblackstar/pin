@@ -69,7 +69,7 @@ func (buffer *boundedBuffer) Write(data []byte) (int, error) {
 		buffer.truncated = true
 		return written, nil
 	}
-	if len(data) >= buffer.limit {
+	if len(data) > buffer.limit {
 		buffer.data = buffer.data[:buffer.limit]
 		copy(buffer.data, data[len(data)-buffer.limit:])
 		buffer.truncated = true

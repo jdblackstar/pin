@@ -622,21 +622,31 @@ func extractGitArchive(repo, sha, destination string) error {
 	go wait("git", archive)
 	go wait("tar", extract)
 
-	var firstFailure *pipelineResult
+	var archiveResult, extractResult pipelineResult
+	failed := false
 	timedOut := false
 	for range 2 {
 		result := <-results
+		if result.stage == "git" {
+			archiveResult = result
+		} else {
+			extractResult = result
+		}
 		timedOut = timedOut || result.timedOut
-		if result.err != nil && !result.timedOut && firstFailure == nil {
-			firstFailure = &result
+		if result.err != nil && !result.timedOut && !failed {
+			failed = true
 			cancel()
 		}
 	}
-	if firstFailure != nil {
-		if firstFailure.stage == "git" {
-			return fmt.Errorf("git archive failed%s", outputDetails(archiveStderr.String()))
+	if failed {
+		var failures []error
+		if archiveResult.err != nil {
+			failures = append(failures, fmt.Errorf("git archive failed: %w%s", archiveResult.err, outputDetails(archiveStderr.String())))
 		}
-		return fmt.Errorf("tar extract failed%s", outputDetails(extractStderr.String()))
+		if extractResult.err != nil {
+			failures = append(failures, fmt.Errorf("tar extract failed: %w%s", extractResult.err, outputDetails(extractStderr.String())))
+		}
+		return errors.Join(failures...)
 	}
 	if timedOut || errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		details := pipelineDetails(archiveStderr.String(), extractStderr.String())

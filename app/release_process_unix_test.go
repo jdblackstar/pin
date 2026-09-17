@@ -3,7 +3,9 @@
 package app
 
 import (
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -80,6 +82,44 @@ exit 9
 	requireContains(t, err.Error(), "extract final diagnostic")
 	if _, statErr := os.Stat(destination); !os.IsNotExist(statErr) {
 		t.Fatalf("partial extraction was not cleaned up: stat error = %v", statErr)
+	}
+}
+
+// TestExtractGitArchiveReportsBothFailuresDeterministically verifies neither stage is hidden.
+func TestExtractGitArchiveReportsBothFailuresDeterministically(t *testing.T) {
+	root := t.TempDir()
+	gitReady := filepath.Join(root, "git-ready")
+	tarReady := filepath.Join(root, "tar-ready")
+	configureArchiveTestCommands(t, `
+printf 'git failure diagnostic\n' >&2
+: > `+shellQuote(gitReady)+`
+while [ ! -e `+shellQuote(tarReady)+` ]; do /bin/sleep 0.01; done
+exit 7
+`, `
+printf 'tar failure diagnostic\n' >&2
+: > `+shellQuote(tarReady)+`
+while [ ! -e `+shellQuote(gitReady)+` ]; do /bin/sleep 0.01; done
+exit 9
+`, commandLimits{timeout: 2 * time.Second, outputLimit: 128})
+
+	err := extractGitArchive(t.TempDir(), "revision", t.TempDir())
+	if err == nil {
+		t.Fatal("extractGitArchive returned nil error when both stages failed")
+	}
+	message := err.Error()
+	gitIndex := strings.Index(message, "git archive failed")
+	tarIndex := strings.Index(message, "tar extract failed")
+	if gitIndex == -1 || tarIndex == -1 {
+		t.Fatalf("pipeline error did not report both failures: %v", err)
+	}
+	if gitIndex > tarIndex {
+		t.Fatalf("pipeline failures are not in deterministic Git-then-tar order: %v", err)
+	}
+	requireContains(t, message, "git failure diagnostic")
+	requireContains(t, message, "tar failure diagnostic")
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("pipeline error does not preserve an underlying exit error: %v", err)
 	}
 }
 

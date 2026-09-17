@@ -10,6 +10,7 @@ import (
 	"time"
 )
 
+// configureArchiveTestCommands installs fake archive tools and temporary command limits.
 func configureArchiveTestCommands(t *testing.T, gitScript, tarScript string, limits commandLimits) {
 	t.Helper()
 	bin := t.TempDir()
@@ -25,6 +26,7 @@ func configureArchiveTestCommands(t *testing.T, gitScript, tarScript string, lim
 	t.Cleanup(func() { defaultCommandLimits = previous })
 }
 
+// TestExtractGitArchiveReportsBoundedArchiveFailure verifies bounded Git diagnostics.
 func TestExtractGitArchiveReportsBoundedArchiveFailure(t *testing.T) {
 	configureArchiveTestCommands(t, `
 i=0
@@ -52,6 +54,7 @@ exit 7
 	}
 }
 
+// TestExtractGitArchiveReportsExtractionFailureAndCleansPartialOutput verifies tar cleanup.
 func TestExtractGitArchiveReportsExtractionFailureAndCleansPartialOutput(t *testing.T) {
 	configureArchiveTestCommands(t, `/bin/sleep 10`, `
 printf 'partial' > "$4/partial"
@@ -80,6 +83,7 @@ exit 9
 	}
 }
 
+// TestExtractGitArchiveTimesOutAndCleansPartialOutput verifies timeout cleanup.
 func TestExtractGitArchiveTimesOutAndCleansPartialOutput(t *testing.T) {
 	configureArchiveTestCommands(t, `
 printf 'archive waiting\n' >&2
@@ -110,6 +114,7 @@ printf 'partial' > "$4/partial"
 	}
 }
 
+// TestRunCommandTimeoutKillsProcessTree verifies descendants are terminated on timeout.
 func TestRunCommandTimeoutKillsProcessTree(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "descendant-survived")
 	script := `(sleep 1; printf survived > "$1") & sleep 10`

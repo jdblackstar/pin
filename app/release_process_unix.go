@@ -9,6 +9,7 @@ import (
 	"syscall"
 )
 
+// configureProcessTree arranges for cancellation to terminate the Unix process group.
 func configureProcessTree(command *exec.Cmd) {
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	command.Cancel = func() error {

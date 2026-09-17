@@ -53,6 +53,7 @@ type boundedBuffer struct {
 	truncated bool
 }
 
+// newBoundedBuffer creates a buffer that retains at most the newest limit bytes.
 func newBoundedBuffer(limit int) *boundedBuffer {
 	if limit < 0 {
 		limit = 0
@@ -60,6 +61,7 @@ func newBoundedBuffer(limit int) *boundedBuffer {
 	return &boundedBuffer{data: make([]byte, 0, limit), limit: limit}
 }
 
+// Write appends data while discarding the oldest bytes beyond the buffer limit.
 func (buffer *boundedBuffer) Write(data []byte) (int, error) {
 	written := len(data)
 	if written == 0 {
@@ -84,6 +86,7 @@ func (buffer *boundedBuffer) Write(data []byte) (int, error) {
 	return written, nil
 }
 
+// String returns retained output with a marker when earlier bytes were discarded.
 func (buffer *boundedBuffer) String() string {
 	if !buffer.truncated {
 		return string(buffer.data)
@@ -563,6 +566,7 @@ func cleanupFailedRelease(path string, cause error, removeAll func(string) error
 	return cause
 }
 
+// extractGitArchive streams a Git revision into tar with bounded time and diagnostics.
 func extractGitArchive(repo, sha, destination string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), defaultCommandLimits.timeout)
 	defer cancel()
@@ -641,6 +645,7 @@ func extractGitArchive(repo, sha, destination string) error {
 	return nil
 }
 
+// pipelineDetails formats non-empty diagnostics from the archive pipeline stages.
 func pipelineDetails(archiveStderr, extractStderr string) string {
 	var details []string
 	if text := strings.TrimSpace(archiveStderr); text != "" {
@@ -1350,6 +1355,7 @@ func releasePath(ctx pinContext, sha string) string {
 	return filepath.Join(ctx.releasesDir(), sha)
 }
 
+// compareCommits reports the ancestry relationship between active and target commits.
 func compareCommits(repo, active, target string) (string, error) {
 	if active == target {
 		return checkCurrent, nil
@@ -1382,6 +1388,7 @@ func fetchTargetSHA(config config) (string, error) {
 	return gitOutput(config.sourcePath, "rev-parse", branchRef(config))
 }
 
+// gitOK reports whether a Git predicate command succeeded and preserves execution errors.
 func gitOK(cwd string, args ...string) (bool, error) {
 	result, err := runGit(cwd, args...)
 	if err == nil {
@@ -1405,10 +1412,12 @@ func gitOutput(cwd string, args ...string) (string, error) {
 	return strings.TrimSpace(result.stdout), nil
 }
 
+// runCommand executes a release subprocess with the default resource limits.
 func runCommand(args []string, cwd string, env []string) (commandResult, error) {
 	return runCommandWithLimits(args, cwd, env, defaultCommandLimits)
 }
 
+// runCommandWithLimits executes a subprocess with bounded runtime and captured output.
 func runCommandWithLimits(args []string, cwd string, env []string, limits commandLimits) (commandResult, error) {
 	if len(args) == 0 {
 		return commandResult{}, fmt.Errorf("empty command")
@@ -1457,6 +1466,7 @@ func runCommandWithLimits(args []string, cwd string, env []string, limits comman
 	return result, nil
 }
 
+// outputDetails formats non-empty subprocess output for inclusion in an error.
 func outputDetails(output string) string {
 	details := strings.TrimSpace(output)
 	if details == "" {

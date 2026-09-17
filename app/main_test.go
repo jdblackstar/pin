@@ -76,12 +76,14 @@ func runCompiledPin(t *testing.T, root string, args ...string) cliResult {
 	return cliResult{code: code, stdout: stdout.String(), stderr: stderr.String()}
 }
 
+// prepareToolEnv isolates tool caches and configuration for a test workspace.
 func prepareToolEnv(t *testing.T, root string) {
 	t.Helper()
 	t.Setenv("UV_CACHE_DIR", filepath.Join(root, "uv-cache"))
 	t.Setenv("PIP_CACHE_DIR", filepath.Join(root, "pip-cache"))
 }
 
+// TestCommandHelperProcess provides subprocess modes for command execution tests.
 func TestCommandHelperProcess(t *testing.T) {
 	if os.Getenv("PIN_COMMAND_HELPER") != "1" {
 		return
@@ -115,14 +117,17 @@ func TestCommandHelperProcess(t *testing.T) {
 	}
 }
 
+// commandHelperArgs returns arguments that reinvoke the test binary in helper mode.
 func commandHelperArgs(mode string) []string {
 	return []string{os.Args[0], "-test.run=^TestCommandHelperProcess$", "--", mode}
 }
 
+// commandHelperEnv enables command helper mode in a subprocess environment.
 func commandHelperEnv() []string {
 	return append(os.Environ(), "PIN_COMMAND_HELPER=1")
 }
 
+// TestBoundedBufferExactLimitIsNotTruncated verifies exact-limit output is preserved.
 func TestBoundedBufferExactLimitIsNotTruncated(t *testing.T) {
 	buffer := newBoundedBuffer(len("exact"))
 	if _, err := buffer.Write([]byte("exact")); err != nil {
@@ -133,6 +138,7 @@ func TestBoundedBufferExactLimitIsNotTruncated(t *testing.T) {
 	}
 }
 
+// TestRunCommandTimesOut verifies commands are terminated at their configured deadline.
 func TestRunCommandTimesOut(t *testing.T) {
 	limits := commandLimits{timeout: 100 * time.Millisecond, outputLimit: 1024}
 	started := time.Now()
@@ -152,6 +158,7 @@ func TestRunCommandTimesOut(t *testing.T) {
 	}
 }
 
+// TestRunCommandBoundsOutputAndRetainsFailureTail verifies bounded failure diagnostics.
 func TestRunCommandBoundsOutputAndRetainsFailureTail(t *testing.T) {
 	const outputLimit = 1024
 	limits := commandLimits{timeout: 5 * time.Second, outputLimit: outputLimit}
@@ -173,6 +180,7 @@ func TestRunCommandBoundsOutputAndRetainsFailureTail(t *testing.T) {
 	requireContains(t, err.Error(), "stderr final diagnostic")
 }
 
+// runTool executes a pin command through the supplied test runner.
 func runTool(t *testing.T, runner pinRunner, root, repo, command string) cliResult {
 	t.Helper()
 	return runner(t, root, command, repo)

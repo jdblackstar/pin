@@ -34,11 +34,15 @@ while [ "$i" -lt 100 ]; do
 done
 printf 'archive final diagnostic\n' >&2
 exit 7
-`, `/bin/cat >/dev/null`, commandLimits{timeout: time.Second, outputLimit: 128})
+`, `/bin/sleep 10`, commandLimits{timeout: 2 * time.Second, outputLimit: 128})
+	started := time.Now()
 
 	err := extractGitArchive(t.TempDir(), "revision", t.TempDir())
 	if err == nil {
 		t.Fatal("extractGitArchive returned nil error for archive failure")
+	}
+	if elapsed := time.Since(started); elapsed >= time.Second {
+		t.Fatalf("archive failure returned after %s, want less than 1s", elapsed)
 	}
 	requireContains(t, err.Error(), "git archive failed")
 	requireContains(t, err.Error(), strings.TrimSpace(truncatedOutputMarker))
@@ -49,21 +53,25 @@ exit 7
 }
 
 func TestExtractGitArchiveReportsExtractionFailureAndCleansPartialOutput(t *testing.T) {
-	configureArchiveTestCommands(t, `printf 'not a tar archive'`, `
+	configureArchiveTestCommands(t, `/bin/sleep 10`, `
 printf 'partial' > "$4/partial"
 printf 'extract final diagnostic\n' >&2
 exit 9
-`, commandLimits{timeout: time.Second, outputLimit: 128})
+`, commandLimits{timeout: 2 * time.Second, outputLimit: 128})
 	destination := filepath.Join(t.TempDir(), "release")
 	if err := os.Mkdir(destination, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	started := time.Now()
 
 	err := cleanupOnError(destination, func() error {
 		return extractGitArchive(t.TempDir(), "revision", destination)
 	})
 	if err == nil {
 		t.Fatal("extractGitArchive returned nil error for extraction failure")
+	}
+	if elapsed := time.Since(started); elapsed >= time.Second {
+		t.Fatalf("extraction failure returned after %s, want less than 1s", elapsed)
 	}
 	requireContains(t, err.Error(), "tar extract failed")
 	requireContains(t, err.Error(), "extract final diagnostic")

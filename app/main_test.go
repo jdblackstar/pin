@@ -123,6 +123,16 @@ func commandHelperEnv() []string {
 	return append(os.Environ(), "PIN_COMMAND_HELPER=1")
 }
 
+func TestBoundedBufferExactLimitIsNotTruncated(t *testing.T) {
+	buffer := newBoundedBuffer(len("exact"))
+	if _, err := buffer.Write([]byte("exact")); err != nil {
+		t.Fatal(err)
+	}
+	if got := buffer.String(); got != "exact" {
+		t.Fatalf("exact-limit output = %q, want %q", got, "exact")
+	}
+}
+
 func TestRunCommandTimesOut(t *testing.T) {
 	limits := commandLimits{timeout: 100 * time.Millisecond, outputLimit: 1024}
 	started := time.Now()

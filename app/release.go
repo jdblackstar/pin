@@ -571,17 +571,20 @@ func extractGitArchive(repo, sha, destination string) error {
 	configureProcessTree(archive)
 	archive.WaitDelay = releaseCommandWaitDelay
 	archive.Dir = repo
-	stdout, err := archive.StdoutPipe()
+	pipeReader, pipeWriter, err := os.Pipe()
 	if err != nil {
 		return err
 	}
+	defer pipeReader.Close()
+	defer pipeWriter.Close()
+	archive.Stdout = pipeWriter
 	archiveStderr := newBoundedBuffer(defaultCommandLimits.outputLimit)
 	archive.Stderr = archiveStderr
 
 	extract := exec.CommandContext(ctx, "tar", "-xf", "-", "-C", destination)
 	configureProcessTree(extract)
 	extract.WaitDelay = releaseCommandWaitDelay
-	extract.Stdin = stdout
+	extract.Stdin = pipeReader
 	extractStderr := newBoundedBuffer(defaultCommandLimits.outputLimit)
 	extract.Stderr = extractStderr
 
@@ -589,21 +592,51 @@ func extractGitArchive(repo, sha, destination string) error {
 		return err
 	}
 	if err := extract.Start(); err != nil {
+		_ = pipeReader.Close()
+		_ = pipeWriter.Close()
 		cancel()
 		_ = archive.Wait()
 		return err
 	}
-	extractErr := extract.Wait()
-	archiveErr := archive.Wait()
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+	_ = pipeReader.Close()
+	_ = pipeWriter.Close()
+
+	type pipelineResult struct {
+		stage    string
+		err      error
+		timedOut bool
+	}
+	results := make(chan pipelineResult, 2)
+	wait := func(stage string, command *exec.Cmd) {
+		err := command.Wait()
+		results <- pipelineResult{
+			stage:    stage,
+			err:      err,
+			timedOut: errors.Is(ctx.Err(), context.DeadlineExceeded),
+		}
+	}
+	go wait("git", archive)
+	go wait("tar", extract)
+
+	var firstFailure *pipelineResult
+	timedOut := false
+	for range 2 {
+		result := <-results
+		timedOut = timedOut || result.timedOut
+		if result.err != nil && !result.timedOut && firstFailure == nil {
+			firstFailure = &result
+			cancel()
+		}
+	}
+	if firstFailure != nil {
+		if firstFailure.stage == "git" {
+			return fmt.Errorf("git archive failed%s", outputDetails(archiveStderr.String()))
+		}
+		return fmt.Errorf("tar extract failed%s", outputDetails(extractStderr.String()))
+	}
+	if timedOut || errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		details := pipelineDetails(archiveStderr.String(), extractStderr.String())
 		return fmt.Errorf("git archive and tar extract timed out after %s%s", defaultCommandLimits.timeout, details)
-	}
-	if archiveErr != nil {
-		return fmt.Errorf("git archive failed%s", outputDetails(archiveStderr.String()))
-	}
-	if extractErr != nil {
-		return fmt.Errorf("tar extract failed%s", outputDetails(extractStderr.String()))
 	}
 	return nil
 }

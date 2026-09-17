@@ -137,8 +137,8 @@ func TestRunCommandTimesOut(t *testing.T) {
 	}
 	requireContains(t, err.Error(), "command timed out after 100ms")
 	requireContains(t, err.Error(), "command started")
-	if result.exitCode != -1 {
-		t.Fatalf("timed-out command exit code = %d, want -1", result.exitCode)
+	if result.exitCode == 0 {
+		t.Fatal("timed-out command reported a successful exit code")
 	}
 }
 

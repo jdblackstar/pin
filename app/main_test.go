@@ -76,12 +76,111 @@ func runCompiledPin(t *testing.T, root string, args ...string) cliResult {
 	return cliResult{code: code, stdout: stdout.String(), stderr: stderr.String()}
 }
 
+// prepareToolEnv isolates tool caches and configuration for a test workspace.
 func prepareToolEnv(t *testing.T, root string) {
 	t.Helper()
 	t.Setenv("UV_CACHE_DIR", filepath.Join(root, "uv-cache"))
 	t.Setenv("PIP_CACHE_DIR", filepath.Join(root, "pip-cache"))
 }
 
+// TestCommandHelperProcess provides subprocess modes for command execution tests.
+func TestCommandHelperProcess(t *testing.T) {
+	if os.Getenv("PIN_COMMAND_HELPER") != "1" {
+		return
+	}
+	separator := -1
+	for i, arg := range os.Args {
+		if arg == "--" {
+			separator = i
+			break
+		}
+	}
+	if separator == -1 || separator+1 >= len(os.Args) {
+		t.Fatal("missing command helper mode")
+	}
+
+	switch os.Args[separator+1] {
+	case "hang":
+		_, _ = os.Stdout.WriteString("command started\n")
+		time.Sleep(2 * time.Second)
+	case "volume-fail":
+		chunk := strings.Repeat("x", 4096)
+		for range 256 {
+			_, _ = os.Stdout.WriteString(chunk)
+			_, _ = os.Stderr.WriteString(chunk)
+		}
+		_, _ = os.Stdout.WriteString("stdout final diagnostic\n")
+		_, _ = os.Stderr.WriteString("stderr final diagnostic\n")
+		os.Exit(23)
+	default:
+		t.Fatalf("unknown command helper mode %q", os.Args[separator+1])
+	}
+}
+
+// commandHelperArgs returns arguments that reinvoke the test binary in helper mode.
+func commandHelperArgs(mode string) []string {
+	return []string{os.Args[0], "-test.run=^TestCommandHelperProcess$", "--", mode}
+}
+
+// commandHelperEnv enables command helper mode in a subprocess environment.
+func commandHelperEnv() []string {
+	return append(os.Environ(), "PIN_COMMAND_HELPER=1")
+}
+
+// TestBoundedBufferExactLimitIsNotTruncated verifies exact-limit output is preserved.
+func TestBoundedBufferExactLimitIsNotTruncated(t *testing.T) {
+	buffer := newBoundedBuffer(len("exact"))
+	if _, err := buffer.Write([]byte("exact")); err != nil {
+		t.Fatal(err)
+	}
+	if got := buffer.String(); got != "exact" {
+		t.Fatalf("exact-limit output = %q, want %q", got, "exact")
+	}
+}
+
+// TestRunCommandTimesOut verifies commands are terminated at their configured deadline.
+func TestRunCommandTimesOut(t *testing.T) {
+	limits := commandLimits{timeout: 100 * time.Millisecond, outputLimit: 1024}
+	started := time.Now()
+	result, err := runCommandWithLimits(commandHelperArgs("hang"), t.TempDir(), commandHelperEnv(), limits)
+	elapsed := time.Since(started)
+
+	if err == nil {
+		t.Fatal("runCommandWithLimits returned nil error for timed-out command")
+	}
+	if elapsed >= time.Second {
+		t.Fatalf("timed-out command returned after %s, want less than 1s", elapsed)
+	}
+	requireContains(t, err.Error(), "command timed out after 100ms")
+	requireContains(t, err.Error(), "command started")
+	if result.exitCode == 0 {
+		t.Fatal("timed-out command reported a successful exit code")
+	}
+}
+
+// TestRunCommandBoundsOutputAndRetainsFailureTail verifies bounded failure diagnostics.
+func TestRunCommandBoundsOutputAndRetainsFailureTail(t *testing.T) {
+	const outputLimit = 1024
+	limits := commandLimits{timeout: 5 * time.Second, outputLimit: outputLimit}
+	result, err := runCommandWithLimits(commandHelperArgs("volume-fail"), t.TempDir(), commandHelperEnv(), limits)
+
+	if err == nil {
+		t.Fatal("runCommandWithLimits returned nil error for failing command")
+	}
+	if result.exitCode != 23 {
+		t.Fatalf("exit code = %d, want 23", result.exitCode)
+	}
+	if len(result.stdout) > outputLimit || len(result.stderr) > outputLimit {
+		t.Fatalf("captured output exceeded limit: stdout=%d stderr=%d limit=%d", len(result.stdout), len(result.stderr), outputLimit)
+	}
+	for name, output := range map[string]string{"stdout": result.stdout, "stderr": result.stderr} {
+		requireContains(t, output, strings.TrimSpace(truncatedOutputMarker))
+		requireContains(t, output, name+" final diagnostic")
+	}
+	requireContains(t, err.Error(), "stderr final diagnostic")
+}
+
+// runTool executes a pin command through the supplied test runner.
 func runTool(t *testing.T, runner pinRunner, root, repo, command string) cliResult {
 	t.Helper()
 	return runner(t, root, command, repo)

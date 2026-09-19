@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$repo_root/.agents/go-toolchain.env"
+
+toolchain_root="$HOME/.local/share/amp/toolchains/go"
+active_toolchain="$toolchain_root/current"
+install_dir="$toolchain_root/$GO_VERSION"
+go_bin="$active_toolchain/bin/go"
+installed_version="$("$go_bin" env GOVERSION 2>/dev/null || true)"
+if [[ "$(readlink "$active_toolchain" 2>/dev/null || true)" != "$install_dir" ]] || [[ "$installed_version" != "$GO_VERSION" ]]; then
+	printf 'PIN orb toolchain is missing or does not match %s; rerun .agents/setup.\n' "$GO_VERSION" >&2
+	exit 1
+fi
+
+"$go_bin" version >/dev/null

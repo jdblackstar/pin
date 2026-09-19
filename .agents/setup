@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+started_at=$SECONDS
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$repo_root/.agents/go-toolchain.env"
+
+step() {
+	printf '\n==> %s\n' "$1"
+}
+
+step "Checking system prerequisites"
+packages=()
+command -v curl >/dev/null 2>&1 || packages+=(curl)
+command -v git >/dev/null 2>&1 || packages+=(git)
+command -v tar >/dev/null 2>&1 || packages+=(tar)
+command -v sha256sum >/dev/null 2>&1 || packages+=(coreutils)
+[[ -s /etc/ssl/certs/ca-certificates.crt ]] || packages+=(ca-certificates)
+
+if ((${#packages[@]})); then
+	apt=(apt-get)
+	if ((EUID != 0)); then
+		apt=(sudo apt-get)
+	fi
+	"${apt[@]}" update
+	DEBIAN_FRONTEND=noninteractive "${apt[@]}" install -y --no-install-recommends "${packages[@]}"
+fi
+
+required_go="$(awk '$1 == "go" { print $2; exit }' "$repo_root/go.mod")"
+if [[ ! "$required_go" =~ ^[0-9]+\.[0-9]+$ ]]; then
+	printf 'Unable to determine the required Go version from go.mod: %q\n' "$required_go" >&2
+	exit 1
+fi
+required_major=${required_go%%.*}
+required_minor=${required_go#*.}
+if [[ ! "$GO_VERSION" =~ ^go([0-9]+)\.([0-9]+)\.[0-9]+$ ]] ||
+	((BASH_REMATCH[1] < required_major || (BASH_REMATCH[1] == required_major && BASH_REMATCH[2] < required_minor))); then
+	printf 'Pinned Go version %q does not satisfy go.mod requirement %s.\n' "$GO_VERSION" "$required_go" >&2
+	exit 1
+fi
+if [[ ! "$GO_LINUX_AMD64_SHA256" =~ ^[[:xdigit:]]{64}$ || ! "$GO_LINUX_ARM64_SHA256" =~ ^[[:xdigit:]]{64}$ ]]; then
+	printf 'Pinned Go checksums must be 64 hexadecimal characters.\n' >&2
+	exit 1
+fi
+
+toolchain_root="$HOME/.local/share/amp/toolchains/go"
+active_toolchain="$toolchain_root/current"
+install_dir="$toolchain_root/$GO_VERSION"
+go_bin="$active_toolchain/bin/go"
+
+go_is_pinned() {
+	local candidate=$1
+	[[ -x "$candidate" ]] && [[ "$("$candidate" env GOVERSION 2>/dev/null || true)" == "$GO_VERSION" ]]
+}
+
+if [[ "$(readlink "$active_toolchain" 2>/dev/null || true)" != "$install_dir" ]] || ! go_is_pinned "$go_bin"; then
+	step "Installing pinned Go toolchain $GO_VERSION"
+	case "$(uname -m)" in
+		x86_64)
+			go_arch=amd64
+			archive_sha=$GO_LINUX_AMD64_SHA256
+			;;
+		aarch64 | arm64)
+			go_arch=arm64
+			archive_sha=$GO_LINUX_ARM64_SHA256
+			;;
+		*) printf 'Unsupported architecture for Go installation: %s\n' "$(uname -m)" >&2; exit 1 ;;
+	esac
+
+	if ! go_is_pinned "$install_dir/bin/go"; then
+		archive_name="$GO_VERSION.linux-$go_arch.tar.gz"
+		tmp_dir="$(mktemp -d)"
+		trap 'rm -rf "$tmp_dir"' EXIT
+		curl -fL "https://go.dev/dl/$archive_name" -o "$tmp_dir/$archive_name"
+		printf '%s  %s\n' "$archive_sha" "$tmp_dir/$archive_name" | sha256sum -c -
+		tar -xzf "$tmp_dir/$archive_name" -C "$tmp_dir"
+		if ! go_is_pinned "$tmp_dir/go/bin/go"; then
+			printf 'Downloaded Go archive does not contain %s.\n' "$GO_VERSION" >&2
+			exit 1
+		fi
+		mkdir -p "$toolchain_root"
+		rm -rf "$install_dir"
+		mv "$tmp_dir/go" "$install_dir"
+		rm -rf "$tmp_dir"
+		trap - EXIT
+	fi
+	rm -rf "$active_toolchain"
+	ln -s "$install_dir" "$active_toolchain"
+	go_bin="$active_toolchain/bin/go"
+fi
+
+profile_marker="# pin orb Go toolchain"
+login_profile="$HOME/.bash_profile"
+for candidate in .bash_profile .bash_login .profile; do
+	if [[ -e "$HOME/$candidate" ]]; then
+		login_profile="$HOME/$candidate"
+		break
+	fi
+done
+if ! grep -Fqx "$profile_marker" "$login_profile" 2>/dev/null; then
+	cat >>"$login_profile" <<'EOF'
+
+# pin orb Go toolchain
+case ":$PATH:" in
+	*:"$HOME/.local/share/amp/toolchains/go/current/bin":*) ;;
+	*) export PATH="$HOME/.local/share/amp/toolchains/go/current/bin:$PATH" ;;
+esac
+case ":$PATH:" in
+	*:"$HOME/go/bin":*) ;;
+	*) export PATH="$HOME/go/bin:$PATH" ;;
+esac
+EOF
+fi
+
+export PATH="$active_toolchain/bin:$HOME/go/bin:$PATH"
+
+step "Downloading Go modules"
+cd "$repo_root"
+"$go_bin" mod download
+
+step "Warming the Go build cache"
+"$go_bin" test -run '^$' ./...
+
+printf '\nOrb setup complete in %ss (%s).\n' "$((SECONDS - started_at))" "$("$go_bin" env GOVERSION)"

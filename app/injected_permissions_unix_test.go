@@ -3,10 +3,33 @@
 package app
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+type removingDirEntry struct {
+	os.DirEntry
+	path string
+}
+
+func (entry removingDirEntry) Info() (os.FileInfo, error) {
+	info, err := entry.DirEntry.Info()
+	if err == nil {
+		err = os.Remove(entry.path)
+	}
+	return info, err
+}
+
+type errorDirEntry struct {
+	os.DirEntry
+	err error
+}
+
+func (entry errorDirEntry) Info() (os.FileInfo, error) {
+	return nil, entry.err
+}
 
 func TestInjectRuntimePathsSeedsPrivateFilesAndDirectories(t *testing.T) {
 	root := t.TempDir()
@@ -58,6 +81,58 @@ func TestInjectRuntimePathsTightensExistingPathsOnEveryUpdate(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertSharedTreePrivate(t, shared)
+}
+
+func TestHardenInjectedPathToleratesConcurrentRemoval(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "runtime")
+	writeFile(t, path, "runtime\n")
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := entries[0]
+
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := hardenInjectedPath(path, entry, nil); err != nil {
+		t.Fatalf("removal before Info returned %v", err)
+	}
+
+	writeFile(t, path, "runtime\n")
+	entries, err = os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry = removingDirEntry{DirEntry: entries[0], path: path}
+	if err := hardenInjectedPath(path, entry, nil); err != nil {
+		t.Fatalf("removal before Chmod returned %v", err)
+	}
+
+	walkErr := &os.PathError{Op: "readdir", Path: path, Err: os.ErrNotExist}
+	if err := hardenInjectedPath(path, nil, walkErr); err != nil {
+		t.Fatalf("walk removal returned %v", err)
+	}
+}
+
+func TestHardenInjectedPathReturnsOtherErrors(t *testing.T) {
+	walkErr := &os.PathError{Op: "readdir", Path: "runtime", Err: os.ErrPermission}
+	if err := hardenInjectedPath("runtime", nil, walkErr); !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("walk error = %v, want permission denied", err)
+	}
+
+	root := t.TempDir()
+	path := filepath.Join(root, "runtime")
+	writeFile(t, path, "runtime\n")
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := errorDirEntry{DirEntry: entries[0], err: os.ErrPermission}
+	if err := hardenInjectedPath(path, entry, nil); !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("Info error = %v, want permission denied", err)
+	}
 }
 
 func makeSharedTreePermissive(t *testing.T, shared string) {

@@ -3,12 +3,16 @@ package app
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
 )
 
 func TestUpdateRejectsArchivedSymlinksOutsideRelease(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink setup requires additional Windows privileges")
+	}
 	tests := []struct {
 		name  string
 		setup func(t *testing.T, root, repo string)
@@ -67,7 +71,7 @@ func TestUpdateRejectsArchivedSymlinksOutsideRelease(t *testing.T) {
 				if err := os.Symlink("..", filepath.Join(repo, "nested", "bridge")); err != nil {
 					t.Fatal(err)
 				}
-				if err := os.Symlink("nested/bridge/../../outside-automation", filepath.Join(repo, "automation")); err != nil {
+				if err := os.Symlink("nested/bridge/../outside-automation", filepath.Join(repo, "automation")); err != nil {
 					t.Fatal(err)
 				}
 			},
@@ -98,6 +102,9 @@ func TestUpdateRejectsArchivedSymlinksOutsideRelease(t *testing.T) {
 }
 
 func TestUpdateAllowsArchivedSymlinksWithinRelease(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink setup requires additional Windows privileges")
+	}
 	root := t.TempDir()
 	repo, _ := sourceRepo(t, root)
 	writeScriptTool(t, repo, "1")
@@ -128,6 +135,9 @@ func TestUpdateAllowsArchivedSymlinksWithinRelease(t *testing.T) {
 }
 
 func TestUpdateAllowsPackageSourceSymlinkWithinRelease(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink setup requires additional Windows privileges")
+	}
 	root := t.TempDir()
 	repo, _ := sourceRepo(t, root)
 	if err := os.Symlink(".", filepath.Join(repo, "package")); err != nil {

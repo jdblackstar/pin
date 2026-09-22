@@ -28,18 +28,21 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           INPUT_TAG_NAME: ${{ inputs.tag_name }}
+          WORKFLOW_RUN_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
           WORKFLOW_RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
           if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
             tag=$INPUT_TAG_NAME
+          elif [[ -n "$WORKFLOW_RUN_HEAD_BRANCH" ]]; then
+            tag=$WORKFLOW_RUN_HEAD_BRANCH
           else
             tag=$(git ls-remote --tags "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" "v*" | awk -v sha="$WORKFLOW_RUN_HEAD_SHA" '
               $1 == sha {
                 ref = $2
                 sub(/\^\{\}$/, "", ref)
                 sub(/^refs\/tags\//, "", ref)
-                if (ref ~ /^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/) {
+                if (ref ~ /^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$/) {
                   print ref
                   exit
                 }
@@ -51,8 +54,8 @@ jobs:
               exit 0
             fi
           fi
-          if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-            echo "::error::Homebrew tags must use stable SemVer format (for example, v1.2.3)."
+          if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
+            echo "::error::Homebrew tags must use stable SemVer format (for example, v1.2.3 or v1.2.3+build.1)."
             exit 1
           fi
           printf 'value=%s\n' "$tag" >> "$GITHUB_OUTPUT"

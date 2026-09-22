@@ -268,6 +268,14 @@ gitignored path exists in the mutable source checkout, `pin` copies it into
 authoritative runtime location. Future releases and rollbacks keep using the
 same injected state.
 
+On Unix, `pin` makes `shared/` and seeded directories accessible only to their
+owner. Seeded files keep their owner's read, write, and execute bits, but group
+and other permissions are removed (for example, a `0644` `.env` becomes
+`0600`). Each update also applies that restriction recursively to an existing
+`shared/` tree, so older permissive installs are tightened in place. This never
+adds a permission that an existing path did not already have. On Windows, file
+access remains governed by Windows ACLs rather than Unix mode bits.
+
 This keeps code pinned to a Git SHA while secrets, tokens, logs, local databases,
 and other runtime state remain writable in one stable place. It also works for
 files that may be replaced atomically. For example, a tool can rewrite

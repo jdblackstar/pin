@@ -360,11 +360,12 @@ rollback, and activation. `pin verify` checks both before and after its configur
 commands, so a verifier that changes protected release content also fails.
 
 The integrity set intentionally excludes configured `inject` paths, `.cache/`,
-Python `__pycache__/` directories, and `.pyc`/`.pyo` bytecode because those hold
-declared runtime state or caches. Injected symlink placement and targets are
-validated separately, while their shared backing content is deliberately
-mutable. `.pin/` is not listed recursively in its own manifest; its metadata and
-manifest are instead cross-bound by the digests described above.
+and Python `__pycache__/` directories because those hold declared runtime state
+or caches. Standalone `.pyc` and `.pyo` files outside `__pycache__/` are included.
+Injected symlink placement and targets are validated separately, while their
+shared backing content is deliberately mutable. `.pin/` is not listed
+recursively in its own manifest; its metadata and manifest are instead
+cross-bound by the digests described above.
 
 This is drift detection for a same-user local tool manager, not a security
 boundary. Release files are not made OS-immutable, and a user or process with

@@ -1245,6 +1245,49 @@ func TestIntegrityDetectsUnexpectedReleaseContentAndMetadataMutation(t *testing.
 	})
 }
 
+func TestIntegrityDetectsStandaloneBytecodeAddition(t *testing.T) {
+	root := t.TempDir()
+	repo, sha := sourceRepo(t, root)
+	result := runTool(t, runPin, root, repo, "update")
+	requireCode(t, result, 0)
+
+	release := filepath.Join(root, "share", "demo-tool", "releases", sha)
+	for _, rel := range []string{"payload.pyc", "payload.pyo"} {
+		writeFile(t, filepath.Join(release, rel), "standalone bytecode\n")
+		result = runPin(t, root, "verify", "demo-tool")
+		requireCode(t, result, 2)
+		requireContains(t, result.stderr, "release integrity mismatch: unexpected "+filepath.ToSlash(rel))
+		if err := os.Remove(filepath.Join(release, rel)); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestIntegrityDetectsStandaloneBytecodeMutation(t *testing.T) {
+	root := t.TempDir()
+	repo, _ := sourceRepo(t, root)
+	paths := []string{"payload.pyc", "payload.pyo"}
+	for _, rel := range paths {
+		writeFile(t, filepath.Join(repo, rel), "original bytecode\n")
+	}
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-m", "add standalone bytecode")
+	git(t, repo, "push")
+	sha := git(t, repo, "rev-parse", "HEAD")
+
+	result := runTool(t, runPin, root, repo, "update")
+	requireCode(t, result, 0)
+	release := filepath.Join(root, "share", "demo-tool", "releases", sha)
+	for _, rel := range paths {
+		path := filepath.Join(release, rel)
+		writeFile(t, path, "modified bytecode\n")
+		result = runPin(t, root, "verify", "demo-tool")
+		requireCode(t, result, 2)
+		requireContains(t, result.stderr, "release integrity mismatch: content changed for "+filepath.ToSlash(rel))
+		writeFile(t, path, "original bytecode\n")
+	}
+}
+
 func TestIntegrityExcludesRuntimeCaches(t *testing.T) {
 	root := t.TempDir()
 	repo, sha := sourceRepo(t, root)

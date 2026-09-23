@@ -355,7 +355,7 @@ func integrityPathExcluded(rel string, config config) bool {
 			return true
 		}
 	}
-	return strings.HasSuffix(rel, ".pyc") || strings.HasSuffix(rel, ".pyo")
+	return false
 }
 
 func integrityEntryForPath(filePath, rel string, dirEntry os.DirEntry) (integrityEntry, error) {

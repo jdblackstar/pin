@@ -16,7 +16,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 )
 
@@ -130,17 +129,16 @@ func decodeIntegrityCache(data []byte, manifestDigest string, entries int) []int
 // loadIntegrityCache returns nil when the cache is missing, unreadable, or
 // belongs to a different manifest; callers then hash every file.
 func loadIntegrityCache(release, manifestDigest string, entries int) []integrityCacheSlot {
-	// O_NONBLOCK keeps a FIFO or device at this path from blocking the open;
-	// only a regular file of the exact expected size is read, so a corrupt or
-	// oversized cache is ignored without being loaded into memory.
-	file, err := os.OpenFile(integrityCachePath(release), os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	// Only a regular file of the exact expected size is read, so a FIFO,
+	// device, or corrupt or oversized cache is ignored without being loaded.
+	file, err := openRegularFile(integrityCachePath(release))
 	if err != nil {
 		return nil
 	}
 	defer file.Close()
 	size := integrityCacheSize(manifestDigest, entries)
 	info, err := file.Stat()
-	if err != nil || !info.Mode().IsRegular() || info.Size() != int64(size) {
+	if err != nil || info.Size() != int64(size) {
 		return nil
 	}
 	data := make([]byte, size)
@@ -289,7 +287,7 @@ func scanIntegrityItem(root string, item integrityWalkItem, want integrityEntry,
 // file still has the state observed during the walk (so it is the same,
 // unmodified inode) and that state is settled.
 func hashIntegrityFile(path string, state integrityFileState, stateOK bool, hasher hash.Hash, buffer []byte, settledCutoff time.Time) (string, integrityCacheSlot, error) {
-	file, err := os.Open(path)
+	file, err := openRegularFile(path)
 	if err != nil {
 		return "", integrityCacheSlot{}, err
 	}

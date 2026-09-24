@@ -5,7 +5,7 @@ description: Install, update, verify, run, inspect, and roll back Python command
 
 # Use PIN
 
-PIN builds immutable Python tool releases from clean Git commits and exposes the active release through a stable `current` directory.
+PIN builds tamper-evident Python tool releases from clean Git commits and exposes the active release through a stable `current` directory. `pin run` and `pin verify` reject protected release content that no longer matches its build-time integrity manifest; declared injected paths and runtime caches remain mutable. `pin verify` rehashes every protected file, while `pin run` rehashes only files whose kernel-reported state changed since they were last verified; use `pin verify` for a full content audit.
 
 ## Inspect first
 

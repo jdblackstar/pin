@@ -1,8 +1,8 @@
 # pin
 
-`pin` installs Python command-line tools from a clean Git checkout into immutable
-release directories, then exposes a stable current release directory for cron
-jobs, agents, and other local automations.
+`pin` installs Python command-line tools from a clean Git checkout into
+tamper-evident release directories, then exposes a stable current release
+directory for cron jobs, agents, and other local automations.
 
 The `0.1.x` scope is intentionally narrow: Python tools only.
 
@@ -52,11 +52,12 @@ pin skill remove
 - builds a new release under `~/.local/share/pin/<tool>/releases/<git-sha>/`
 - injects optional untracked runtime paths into the release
 - creates a Python virtual environment at `.venv/` inside that release
+- records a SHA-256 integrity manifest for the archived source and virtualenv
 - verifies the candidate before activation
 - atomically updates `current` and `previous` symlinks
 
 `pin run <tool>` resolves that stable `current` directory and runs the active
-entrypoint from inside the release checkout.
+entrypoint from inside the release checkout after checking its integrity.
 
 ## Quickstart
 
@@ -309,6 +310,8 @@ runtime files added alongside the repo contents:
       tokens -> ../../shared/tokens
       logs -> ../../shared/logs
       .venv/
+      .pin/integrity.json
+      .pin/integrity.cache
       .pin/release.json
 ```
 
@@ -349,6 +352,52 @@ are used when no namespaced install exists.
 
 ## Safety Model
 
+Every new release records file type, permission mode, symlink target, and a
+SHA-256 digest for each regular file in the archived checkout and installed
+virtualenv. `release.json` contains the digest of `.pin/integrity.json`, and the
+manifest contains a digest of the release metadata payload. PIN compares the
+manifest with the release before `pin run`, `pin verify`, same-SHA reuse,
+rollback, and activation. `pin verify` checks both before and after its configured
+commands, so a verifier that changes protected release content also fails.
+
+The integrity set intentionally excludes configured `inject` paths, `.cache/`,
+and Python `__pycache__/` directories because those hold declared runtime state
+or caches. Standalone `.pyc` and `.pyo` files outside `__pycache__/` are included.
+Injected symlink placement and targets are validated separately, while their
+shared backing content is deliberately mutable. `.pin/` is not listed
+recursively in its own manifest; its metadata and manifest are instead
+cross-bound by the digests described above.
+
+`pin verify`, same-SHA reuse, rollback, and the recheck after verify commands
+rehash every protected file. `pin run` uses a faster check on Linux and macOS:
+after a file has been hashed and matched the manifest, PIN records its device,
+inode, size, mtime, and ctime in `.pin/integrity.cache`, and later runs rehash
+only files whose recorded state changed. Paths, types, modes, and symlink
+targets are still compared on every run. Any ordinary write, truncation, chmod,
+or replacement changes ctime or the inode, and unprivileged processes cannot set
+ctime, so this detects the same drift that rehashing does. It does not detect
+changes that bypass the kernel's file-state tracking, such as raw block-device
+writes, silent disk corruption, or a system clock rolled back by a privileged
+user. Files changed within two seconds of being checked are not recorded, which
+guards against coarse filesystem timestamps. A missing, stale, or malformed
+cache only makes the next check rehash; other platforms always rehash. Checks
+repeated within a single `update` or `rollback`, immediately after a full check,
+use the same fast path. Run `pin verify` for a full content audit.
+
+This is drift detection for a same-user local tool manager, not a security
+boundary. Release files are not made OS-immutable, and a user or process with
+write access can deliberately replace content and recompute both metadata and
+manifest. PIN reliably detects post-build changes that have not also rewritten
+that integrity evidence. Directly invoking a release entrypoint bypasses PIN's
+pre-run check; use `pin run` when that check is required.
+
+Metadata schemas 2 and 3 remain readable, and new integrity data is additive to
+schema 3. Releases built by older PIN versions have no trustworthy virtualenv
+baseline, so PIN does not silently enroll their current contents. `status`,
+`list`, and `check` can still inspect them, but run, verify, rollback/activation,
+and same-SHA reuse fail closed. Commit a new clean source revision and run
+`pin update` to build a release with integrity evidence.
+
 `pin update` refuses to activate a release when:
 
 - the source checkout is dirty
@@ -357,6 +406,8 @@ are used when no namespaced install exists.
 - a configured injected path is missing from both `shared/` and the source checkout
 - preflight commands fail
 - candidate verification fails
+- release metadata, archived source, or installed virtualenv differs from its
+  integrity evidence
 
 Candidates that are built but fail verification or activation stay in place for
 inspection. Pin attempts to clean up build-time failures. If cleanup fails, Pin

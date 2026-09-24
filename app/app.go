@@ -361,7 +361,7 @@ func resolveInjectedPaths(ctx pinContext, inject []string) []string {
 }
 
 func (a app) commandVerify(ctx pinContext) error {
-	metadata, err := verifyActive(ctx)
+	metadata, err := verifyActive(ctx, fullIntegrityCheck)
 	if err != nil {
 		return err
 	}
@@ -444,6 +444,9 @@ func (a app) commandRun(ctx pinContext, args []string) error {
 		return err
 	}
 	if err := verifyInjectedPaths(ctx, release, metadata, *config); err != nil {
+		return err
+	}
+	if err := verifyReleaseIntegrity(release, *config, cachedIntegrityCheck); err != nil {
 		return err
 	}
 	entrypoint := filepath.Join(release, venvDir, "bin", metadata.string("entrypoint"))

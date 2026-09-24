@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -276,6 +277,32 @@ func TestIntegrityCacheIgnoresOversizedCacheWithoutReadingIt(t *testing.T) {
 	}
 	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 1<<20 {
 		t.Fatalf("loading an oversized cache allocated %d bytes, want it rejected before reading", allocated)
+	}
+	if err := verifyReleaseIntegrity(release, cfg, cachedIntegrityCheck); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestIntegrityCacheIgnoresFIFOWithoutBlocking(t *testing.T) {
+	release, cfg := newIntegrityTestRelease(t, map[string]string{"a.py": "a\n"})
+	digest, manifest := readTestIntegrityManifest(t, release)
+	cachePath := integrityCachePath(release)
+	if err := os.Remove(cachePath); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(cachePath, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded := make(chan []integrityCacheSlot, 1)
+	go func() { loaded <- loadIntegrityCache(release, digest, len(manifest.Entries)) }()
+	select {
+	case slots := <-loaded:
+		if slots != nil {
+			t.Fatal("FIFO cache was accepted")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("loading a FIFO cache blocked, want it rejected without waiting for a writer")
 	}
 	if err := verifyReleaseIntegrity(release, cfg, cachedIntegrityCheck); err != nil {
 		t.Fatal(err)

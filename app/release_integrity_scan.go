@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -129,16 +130,17 @@ func decodeIntegrityCache(data []byte, manifestDigest string, entries int) []int
 // loadIntegrityCache returns nil when the cache is missing, unreadable, or
 // belongs to a different manifest; callers then hash every file.
 func loadIntegrityCache(release, manifestDigest string, entries int) []integrityCacheSlot {
-	file, err := os.Open(integrityCachePath(release))
+	// O_NONBLOCK keeps a FIFO or device at this path from blocking the open;
+	// only a regular file of the exact expected size is read, so a corrupt or
+	// oversized cache is ignored without being loaded into memory.
+	file, err := os.OpenFile(integrityCachePath(release), os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return nil
 	}
 	defer file.Close()
-	// Read only the exact expected size so a corrupt or oversized cache is
-	// ignored without being loaded into memory.
 	size := integrityCacheSize(manifestDigest, entries)
 	info, err := file.Stat()
-	if err != nil || info.Size() != int64(size) {
+	if err != nil || !info.Mode().IsRegular() || info.Size() != int64(size) {
 		return nil
 	}
 	data := make([]byte, size)

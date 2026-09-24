@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -227,10 +228,13 @@ func previousRelease(ctx pinContext) (string, error) {
 
 func readReleaseMetadata(release string) (releaseMetadata, error) {
 	path := filepath.Join(release, metadataDir, metadataName)
-	file, err := os.Open(path)
+	file, err := openRegularFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, fmt.Errorf("missing metadata: %s", path)
+		}
+		if errors.Is(err, errNotRegularFile) {
+			return nil, fmt.Errorf("invalid metadata: %s: %w", path, errNotRegularFile)
 		}
 		return nil, err
 	}
@@ -332,8 +336,29 @@ func integrityPathExcluded(rel string, config config) bool {
 		strings.HasSuffix(rel, "/"+pycache) || strings.Contains(rel, "/"+pycache+"/")
 }
 
+var errNotRegularFile = errors.New("not a regular file")
+
+// openRegularFile opens path for reading only if it is a regular file.
+// O_NONBLOCK keeps a FIFO or device at path from blocking the open, and the
+// type is checked on the opened descriptor so it cannot be swapped afterwards.
+func openRegularFile(path string) (*os.File, error) {
+	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	info, err := file.Stat()
+	if err == nil && !info.Mode().IsRegular() {
+		err = &os.PathError{Op: "open", Path: path, Err: errNotRegularFile}
+	}
+	if err != nil {
+		file.Close()
+		return nil, err
+	}
+	return file, nil
+}
+
 func hashFile(filePath string) (string, error) {
-	file, err := os.Open(filePath)
+	file, err := openRegularFile(filePath)
 	if err != nil {
 		return "", err
 	}
@@ -1184,10 +1209,18 @@ func verifyReleaseIntegrity(release string, config config, check integrityCheck)
 		return err
 	}
 	manifestPath := filepath.Join(release, metadataDir, integrityName)
-	manifestData, err := os.ReadFile(manifestPath)
+	manifestFile, err := openRegularFile(manifestPath)
 	if errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("release integrity manifest is missing: %s", manifestPath)
 	}
+	if errors.Is(err, errNotRegularFile) {
+		return fmt.Errorf("invalid release integrity manifest: %s: %w", manifestPath, errNotRegularFile)
+	}
+	if err != nil {
+		return err
+	}
+	manifestData, err := io.ReadAll(manifestFile)
+	manifestFile.Close()
 	if err != nil {
 		return err
 	}

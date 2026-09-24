@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -251,6 +252,33 @@ func TestIntegrityCacheIgnoresUnusableCache(t *testing.T) {
 			}
 			requireIntegrityError(t, verifyReleaseIntegrity(release, cfg, cachedIntegrityCheck), "content changed for pkg/b.py")
 		})
+	}
+}
+
+func TestIntegrityCacheIgnoresOversizedCacheWithoutReadingIt(t *testing.T) {
+	release, cfg := newIntegrityTestRelease(t, map[string]string{"a.py": "a\n"})
+	digest, manifest := readTestIntegrityManifest(t, release)
+	cachePath := integrityCachePath(release)
+	if err := os.WriteFile(cachePath, encodeIntegrityCache(digest, make([]integrityCacheSlot, len(manifest.Entries))), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A valid prefix extended to a sparse 8 GiB file.
+	if err := os.Truncate(cachePath, 8<<30); err != nil {
+		t.Fatal(err)
+	}
+
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	slots := loadIntegrityCache(release, digest, len(manifest.Entries))
+	runtime.ReadMemStats(&after)
+	if slots != nil {
+		t.Fatal("oversized cache was accepted")
+	}
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 1<<20 {
+		t.Fatalf("loading an oversized cache allocated %d bytes, want it rejected before reading", allocated)
+	}
+	if err := verifyReleaseIntegrity(release, cfg, cachedIntegrityCheck); err != nil {
+		t.Fatal(err)
 	}
 }
 

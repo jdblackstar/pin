@@ -81,7 +81,7 @@ var integrityCacheMagic = []byte("PINIC001")
 const integrityCacheSlotSize = 1 + 5*8
 
 func encodeIntegrityCache(manifestDigest string, slots []integrityCacheSlot) []byte {
-	data := make([]byte, 0, len(integrityCacheMagic)+len(manifestDigest)+8+len(slots)*integrityCacheSlotSize)
+	data := make([]byte, 0, integrityCacheSize(manifestDigest, len(slots)))
 	data = append(data, integrityCacheMagic...)
 	data = append(data, manifestDigest...)
 	data = binary.LittleEndian.AppendUint64(data, uint64(len(slots)))
@@ -102,11 +102,10 @@ func encodeIntegrityCache(manifestDigest string, slots []integrityCacheSlot) []b
 // manifestDigest with one slot per manifest entry.
 func decodeIntegrityCache(data []byte, manifestDigest string, entries int) []integrityCacheSlot {
 	header := len(integrityCacheMagic) + len(manifestDigest) + 8
-	if len(data) < header ||
+	if len(data) != integrityCacheSize(manifestDigest, entries) ||
 		!bytes.Equal(data[:len(integrityCacheMagic)], integrityCacheMagic) ||
 		string(data[len(integrityCacheMagic):header-8]) != manifestDigest ||
-		binary.LittleEndian.Uint64(data[header-8:header]) != uint64(entries) ||
-		len(data) != header+entries*integrityCacheSlotSize {
+		binary.LittleEndian.Uint64(data[header-8:header]) != uint64(entries) {
 		return nil
 	}
 	slots := make([]integrityCacheSlot, entries)
@@ -130,11 +129,27 @@ func decodeIntegrityCache(data []byte, manifestDigest string, entries int) []int
 // loadIntegrityCache returns nil when the cache is missing, unreadable, or
 // belongs to a different manifest; callers then hash every file.
 func loadIntegrityCache(release, manifestDigest string, entries int) []integrityCacheSlot {
-	data, err := os.ReadFile(integrityCachePath(release))
+	file, err := os.Open(integrityCachePath(release))
 	if err != nil {
 		return nil
 	}
+	defer file.Close()
+	// Read only the exact expected size so a corrupt or oversized cache is
+	// ignored without being loaded into memory.
+	size := integrityCacheSize(manifestDigest, entries)
+	info, err := file.Stat()
+	if err != nil || info.Size() != int64(size) {
+		return nil
+	}
+	data := make([]byte, size)
+	if _, err := io.ReadFull(file, data); err != nil {
+		return nil
+	}
 	return decodeIntegrityCache(data, manifestDigest, entries)
+}
+
+func integrityCacheSize(manifestDigest string, entries int) int {
+	return len(integrityCacheMagic) + len(manifestDigest) + 8 + entries*integrityCacheSlotSize
 }
 
 // saveIntegrityCache is best effort: a release directory that cannot be

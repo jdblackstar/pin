@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"os/signal"
 	"path"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -256,7 +258,7 @@ func writeReleaseMetadata(release, metadataReleasePath string, config config, sh
 		"release_path":   metadataReleasePath,
 		"config":         config.raw,
 	}
-	manifest, err := buildIntegrityManifest(release, metadata, config)
+	manifest, slots, err := buildIntegrityManifest(release, metadata, config)
 	if err != nil {
 		return err
 	}
@@ -276,23 +278,27 @@ func writeReleaseMetadata(release, metadataReleasePath string, config config, sh
 		Algorithm:      integrityAlgorithm,
 		ManifestSHA256: manifestDigest,
 	}
-	return atomicWriteJSON(metadataPath, metadata)
+	if err := atomicWriteJSON(metadataPath, metadata); err != nil {
+		return err
+	}
+	saveIntegrityCache(release, manifestDigest, nil, slots)
+	return nil
 }
 
-func buildIntegrityManifest(release string, metadata releaseMetadata, config config) (integrityManifest, error) {
+func buildIntegrityManifest(release string, metadata releaseMetadata, config config) (integrityManifest, []integrityCacheSlot, error) {
 	metadataDigest, err := hashMetadataPayload(metadata)
 	if err != nil {
-		return integrityManifest{}, err
+		return integrityManifest{}, nil, err
 	}
-	entries, err := collectIntegrityEntries(release, config)
+	entries, slots, err := collectIntegrityEntries(release, config, nil, nil)
 	if err != nil {
-		return integrityManifest{}, err
+		return integrityManifest{}, nil, err
 	}
 	return integrityManifest{
 		Version:        1,
 		MetadataSHA256: metadataDigest,
 		Entries:        entries,
-	}, nil
+	}, slots, nil
 }
 
 func hashMetadataPayload(metadata releaseMetadata) (string, error) {
@@ -309,35 +315,6 @@ func hashMetadataPayload(metadata releaseMetadata) (string, error) {
 	return hashBytes(data), nil
 }
 
-func collectIntegrityEntries(release string, config config) ([]integrityEntry, error) {
-	var entries []integrityEntry
-	err := filepath.WalkDir(release, func(filePath string, dirEntry os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		rel, err := filepath.Rel(release, filePath)
-		if err != nil {
-			return err
-		}
-		if rel == "." {
-			return nil
-		}
-		if integrityPathExcluded(rel, config) {
-			if dirEntry.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		entry, err := integrityEntryForPath(filePath, rel, dirEntry)
-		if err != nil {
-			return err
-		}
-		entries = append(entries, entry)
-		return nil
-	})
-	return entries, err
-}
-
 func integrityPathExcluded(rel string, config config) bool {
 	rel = filepath.ToSlash(rel)
 	if rel == metadataDir || strings.HasPrefix(rel, metadataDir+"/") ||
@@ -350,38 +327,9 @@ func integrityPathExcluded(rel string, config config) bool {
 			return true
 		}
 	}
-	for _, part := range strings.Split(rel, "/") {
-		if part == "__pycache__" {
-			return true
-		}
-	}
-	return false
-}
-
-func integrityEntryForPath(filePath, rel string, dirEntry os.DirEntry) (integrityEntry, error) {
-	info, err := dirEntry.Info()
-	if err != nil {
-		return integrityEntry{}, err
-	}
-	entry := integrityEntry{
-		Path: filepath.ToSlash(rel),
-		Mode: fmt.Sprintf("%04o", info.Mode().Perm()),
-	}
-	switch {
-	case info.Mode().IsRegular():
-		entry.Type = "file"
-		entry.SHA256, err = hashFile(filePath)
-	case info.IsDir():
-		entry.Type = "directory"
-	case info.Mode()&os.ModeSymlink != 0:
-		entry.Type = "symlink"
-		var target string
-		target, err = os.Readlink(filePath)
-		entry.SHA256 = hashBytes([]byte(target))
-	default:
-		err = fmt.Errorf("unsupported release file type: %s", filePath)
-	}
-	return entry, err
+	const pycache = "__pycache__"
+	return rel == pycache || strings.HasPrefix(rel, pycache+"/") ||
+		strings.HasSuffix(rel, "/"+pycache) || strings.Contains(rel, "/"+pycache+"/")
 }
 
 func hashFile(filePath string) (string, error) {
@@ -394,23 +342,29 @@ func hashFile(filePath string) (string, error) {
 	if _, err := io.Copy(hash, file); err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("%x", hash.Sum(nil)), nil
+	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 func hashBytes(data []byte) string {
 	digest := sha256.Sum256(data)
-	return fmt.Sprintf("%x", digest)
+	return hex.EncodeToString(digest[:])
 }
 
 func atomicWriteJSON(path string, payload any) error {
+	return atomicWriteFile(path, func(file io.Writer) error {
+		encoder := json.NewEncoder(file)
+		encoder.SetIndent("", "  ")
+		return encoder.Encode(payload)
+	})
+}
+
+func atomicWriteFile(path string, write func(io.Writer) error) error {
 	tmp := filepath.Join(filepath.Dir(path), fmt.Sprintf(".%s.%d.tmp", filepath.Base(path), os.Getpid()))
 	file, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		return err
 	}
-	encoder := json.NewEncoder(file)
-	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(payload); err != nil {
+	if err := write(file); err != nil {
 		file.Close()
 		os.Remove(tmp)
 		return err
@@ -485,7 +439,8 @@ func updateRelease(ctx pinContext) (updateReport, error) {
 	}
 
 	if err := runSteps(
-		releaseStep{"verify release", func() error { return verifyRelease(ctx, release, false) }},
+		// ensureRelease just built or fully rechecked this release.
+		releaseStep{"verify release", func() error { return verifyRelease(ctx, release, false, cachedIntegrityCheck) }},
 	); err != nil {
 		return updateReport{}, err
 	}
@@ -518,7 +473,7 @@ func rollbackRelease(ctx pinContext) (rollbackReport, error) {
 	previousSHA := filepath.Base(previousTarget)
 
 	if err := runSteps(
-		releaseStep{"verify previous release", func() error { return verifyRelease(ctx, previousTarget, false) }},
+		releaseStep{"verify previous release", func() error { return verifyRelease(ctx, previousTarget, false, fullIntegrityCheck) }},
 	); err != nil {
 		return rollbackReport{}, err
 	}
@@ -574,7 +529,7 @@ func ensureRelease(ctx pinContext, config config, sha string) (string, error) {
 		return "", fmt.Errorf("existing release %s cannot be safely reused: %w", release, err)
 	}
 	if sameConfig(config, *storedConfig) {
-		if err := verifyReleaseIntegrity(release, *storedConfig); err != nil {
+		if err := verifyReleaseIntegrity(release, *storedConfig, fullIntegrityCheck); err != nil {
 			return "", fmt.Errorf("existing release %s cannot be safely reused: %w", release, err)
 		}
 		return release, nil
@@ -1172,18 +1127,22 @@ func pythonCommand() (string, error) {
 	return "", fmt.Errorf("python3 or python is required to build releases")
 }
 
-func verifyActive(ctx pinContext) (releaseMetadata, error) {
+func verifyActive(ctx pinContext, precheck integrityCheck) (releaseMetadata, error) {
 	release, err := activeRelease(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if err := verifyRelease(ctx, release, true); err != nil {
+	if err := verifyRelease(ctx, release, true, precheck); err != nil {
 		return nil, err
 	}
 	return readReleaseMetadata(release)
 }
 
-func verifyRelease(ctx pinContext, release string, expectActive bool) error {
+// verifyRelease checks integrity before and after the configured verify
+// commands. precheck may be cachedIntegrityCheck only when the caller fully
+// checked this release earlier in the same command and no release code has run
+// since; the recheck after verify commands is always full.
+func verifyRelease(ctx pinContext, release string, expectActive bool, precheck integrityCheck) error {
 	if err := requireDirectory(release, "release"); err != nil {
 		return err
 	}
@@ -1201,7 +1160,7 @@ func verifyRelease(ctx pinContext, release string, expectActive bool) error {
 		releaseStep{"validate metadata", func() error { return validateMetadata(ctx, release, metadata, *config) }},
 		releaseStep{"check injected paths", func() error { return verifyInjectedPaths(ctx, release, metadata, *config) }},
 		releaseStep{"check entrypoint", func() error { return requireFile(entrypoint, "missing entrypoint") }},
-		releaseStep{"check release integrity", func() error { return verifyReleaseIntegrity(release, *config) }},
+		releaseStep{"check release integrity", func() error { return verifyReleaseIntegrity(release, *config, precheck) }},
 		releaseStep{"check active link", func() error {
 			if !expectActive {
 				return nil
@@ -1211,11 +1170,11 @@ func verifyRelease(ctx pinContext, release string, expectActive bool) error {
 		releaseStep{"run verify commands", func() error {
 			return runConfiguredCommands(config.verify, release, entrypointEnv(entrypoint))
 		}},
-		releaseStep{"recheck release integrity", func() error { return verifyReleaseIntegrity(release, *config) }},
+		releaseStep{"recheck release integrity", func() error { return verifyReleaseIntegrity(release, *config, fullIntegrityCheck) }},
 	)
 }
 
-func verifyReleaseIntegrity(release string, config config) error {
+func verifyReleaseIntegrity(release string, config config, check integrityCheck) error {
 	metadata, err := readReleaseMetadata(release)
 	if err != nil {
 		return err
@@ -1250,11 +1209,21 @@ func verifyReleaseIntegrity(release string, config config) error {
 	if metadataDigest != manifest.MetadataSHA256 {
 		return fmt.Errorf("release metadata digest changed: %s", filepath.Join(release, metadataDir, metadataName))
 	}
-	actual, err := collectIntegrityEntries(release, config)
+	cached := loadIntegrityCache(release, reference.ManifestSHA256, len(manifest.Entries))
+	var reuse []integrityCacheSlot
+	if check == cachedIntegrityCheck {
+		reuse = cached
+	}
+	actual, slots, err := collectIntegrityEntries(release, config, manifest.Entries, reuse)
 	if err != nil {
 		return err
 	}
-	return compareIntegrityEntries(manifest.Entries, actual)
+	if err := compareIntegrityEntries(manifest.Entries, actual); err != nil {
+		return err
+	}
+	// actual equals the manifest, so slots stay aligned with its entries.
+	saveIntegrityCache(release, reference.ManifestSHA256, cached, slots)
+	return nil
 }
 
 func parseIntegrityReference(metadata releaseMetadata) (integrityReference, error) {
@@ -1277,6 +1246,12 @@ func parseIntegrityReference(metadata releaseMetadata) (integrityReference, erro
 }
 
 func compareIntegrityEntries(expected, actual []integrityEntry) error {
+	// Scanned entries are valid and unique by construction, so an identical
+	// manifest needs no further validation. The map-based comparison below
+	// explains any difference.
+	if slices.Equal(expected, actual) {
+		return nil
+	}
 	expectedByPath := make(map[string]integrityEntry, len(expected))
 	for _, entry := range expected {
 		if !validIntegrityEntry(entry) {
@@ -1523,7 +1498,8 @@ func activateAndVerifyRelease(ctx pinContext, sha, activationStep string) error 
 		return runSteps(
 			releaseStep{activationStep, func() error { return activateRelease(ctx, sha) }},
 			releaseStep{"verify active release", func() error {
-				_, err := verifyActive(ctx)
+				// Activation follows a full recheck of this release.
+				_, err := verifyActive(ctx, cachedIntegrityCheck)
 				return err
 			}},
 		)
@@ -1647,7 +1623,8 @@ func activateRelease(ctx pinContext, sha string) error {
 	if err := verifyInjectedPaths(ctx, target, metadata, *config); err != nil {
 		return err
 	}
-	if err := verifyReleaseIntegrity(target, *config); err != nil {
+	// Every caller fully rechecks the release immediately before activation.
+	if err := verifyReleaseIntegrity(target, *config, cachedIntegrityCheck); err != nil {
 		return err
 	}
 

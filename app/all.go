@@ -141,7 +141,7 @@ func (a app) commandVerifyAll(opts globalOptions) error {
 		ctx, err := resolveToolContext(name, opts)
 		var metadata releaseMetadata
 		if err == nil {
-			metadata, err = verifyActive(ctx)
+			metadata, err = verifyActive(ctx, fullIntegrityCheck)
 		}
 		if err != nil {
 			failed++

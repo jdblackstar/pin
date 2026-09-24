@@ -311,6 +311,7 @@ runtime files added alongside the repo contents:
       logs -> ../../shared/logs
       .venv/
       .pin/integrity.json
+      .pin/integrity.cache
       .pin/release.json
 ```
 
@@ -366,6 +367,22 @@ Injected symlink placement and targets are validated separately, while their
 shared backing content is deliberately mutable. `.pin/` is not listed
 recursively in its own manifest; its metadata and manifest are instead
 cross-bound by the digests described above.
+
+`pin verify`, same-SHA reuse, rollback, and the recheck after verify commands
+rehash every protected file. `pin run` uses a faster check on Linux and macOS:
+after a file has been hashed and matched the manifest, PIN records its device,
+inode, size, mtime, and ctime in `.pin/integrity.cache`, and later runs rehash
+only files whose recorded state changed. Paths, types, modes, and symlink
+targets are still compared on every run. Any ordinary write, truncation, chmod,
+or replacement changes ctime or the inode, and unprivileged processes cannot set
+ctime, so this detects the same drift that rehashing does. It does not detect
+changes that bypass the kernel's file-state tracking, such as raw block-device
+writes, silent disk corruption, or a system clock rolled back by a privileged
+user. Files changed within two seconds of being checked are not recorded, which
+guards against coarse filesystem timestamps. A missing, stale, or malformed
+cache only makes the next check rehash; other platforms always rehash. Checks
+repeated within a single `update` or `rollback`, immediately after a full check,
+use the same fast path. Run `pin verify` for a full content audit.
 
 This is drift detection for a same-user local tool manager, not a security
 boundary. Release files are not made OS-immutable, and a user or process with

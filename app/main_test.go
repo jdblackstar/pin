@@ -824,6 +824,37 @@ func TestMissingPathLikeContextReportsPathDoesNotExist(t *testing.T) {
 	}
 }
 
+func TestRelativeSourcePathsResolveAgainstWorkingDirectory(t *testing.T) {
+	root := t.TempDir()
+	repo, sha := sourceRepo(t, root)
+
+	t.Chdir(repo)
+	for _, arg := range []string{".", "./"} {
+		result := runPin(t, root, "check", arg)
+		requireCode(t, result, 1)
+		requireContains(t, result.stdout, "status: not-installed")
+	}
+
+	result := runPin(t, root, "update", ".")
+	requireCode(t, result, 0)
+	requireContains(t, result.stdout, "updated: demo-tool "+sha)
+	requireInstalledVersion(t, root, "1")
+
+	result = runPin(t, root, "status", "demo-tool")
+	requireCode(t, result, 0)
+	requireContains(t, result.stdout, "source_path: "+repo)
+
+	t.Chdir(filepath.Dir(repo))
+	result = runPin(t, root, "check", filepath.Base(repo))
+	requireCode(t, result, 0)
+	requireContains(t, result.stdout, "status: current")
+
+	t.Chdir(filepath.Join(root, "share"))
+	result = runPin(t, root, "check", filepath.Join("..", filepath.Base(repo)))
+	requireCode(t, result, 0)
+	requireContains(t, result.stdout, "status: current")
+}
+
 func TestGlobalHelpPrintsUsageOnce(t *testing.T) {
 	result := runPin(t, t.TempDir(), "--help")
 	requireCode(t, result, 0)

@@ -89,7 +89,7 @@ func resolveContext(toolOrPath string, hasArg bool, opts globalOptions) (pinCont
 	}
 
 	if looksLikePath(toolOrPath) {
-		return pinContext{}, fmt.Errorf("path does not exist: %s", candidate)
+		return pinContext{}, fmt.Errorf("path does not exist: %s", expandPath(toolOrPath))
 	}
 
 	return resolveToolContext(toolOrPath, opts)
@@ -179,7 +179,7 @@ func resolveSourceContext(toolOrPath string, hasArg bool, opts globalOptions) (p
 	}
 
 	if looksLikePath(toolOrPath) {
-		return pinContext{}, fmt.Errorf("path does not exist: %s", candidate)
+		return pinContext{}, fmt.Errorf("path does not exist: %s", expandPath(toolOrPath))
 	}
 
 	return resolveInstalledSourceContext(toolOrPath, opts)
@@ -187,7 +187,9 @@ func resolveSourceContext(toolOrPath string, hasArg bool, opts globalOptions) (p
 
 func resolveContextCandidate(toolOrPath string, hasArg bool) (string, error) {
 	if hasArg {
-		return expandPath(toolOrPath), nil
+		// Resolve relative paths against the working directory so they compare
+		// correctly with the absolute Git top-level and persisted source paths.
+		return filepath.Abs(expandPath(toolOrPath))
 	}
 	return os.Getwd()
 }

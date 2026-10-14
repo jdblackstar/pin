@@ -611,20 +611,22 @@ func inspectSkillAt(path string) (skillInstallState, error) {
 	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
 		return skillUnmanaged, nil
 	}
-	skillData, err := os.ReadFile(filepath.Join(path, "SKILL.md"))
-	if errors.Is(err, os.ErrNotExist) {
-		return skillUnmanaged, nil
+	var contents [2][]byte
+	for i, name := range []string{"SKILL.md", skillMarkerName} {
+		file, err := openRegularFile(filepath.Join(path, name))
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, errNotRegularFile) {
+			return skillUnmanaged, nil
+		}
+		if err != nil {
+			return "", err
+		}
+		contents[i], err = io.ReadAll(file)
+		file.Close()
+		if err != nil {
+			return "", err
+		}
 	}
-	if err != nil {
-		return "", err
-	}
-	markerData, err := os.ReadFile(filepath.Join(path, skillMarkerName))
-	if errors.Is(err, os.ErrNotExist) {
-		return skillUnmanaged, nil
-	}
-	if err != nil {
-		return "", err
-	}
+	skillData, markerData := contents[0], contents[1]
 	var marker skillMarker
 	if err := json.Unmarshal(markerData, &marker); err != nil || marker.Skill != pinSkillName || marker.Digest == "" {
 		return skillUnmanaged, nil

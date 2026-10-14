@@ -7,7 +7,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -169,4 +172,89 @@ func TestRunCommandTimeoutKillsProcessTree(t *testing.T) {
 	if _, err := os.Stat(marker); !os.IsNotExist(err) {
 		t.Fatalf("timed-out descendant was not terminated: stat error = %v", err)
 	}
+}
+
+// Reproduce the assessment's exited-parent fixture. Cancellation alone cannot
+// clean up descendants once os/exec has stopped watching the command context.
+func TestRunCommandCleansDescendantsAfterParentExits(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		timeout time.Duration
+		pipes   bool
+		exit    int
+	}{
+		{"inherited pipes", 5 * time.Second, true, 0},
+		{"inherited pipes at deadline", 100 * time.Millisecond, true, 0},
+		{"closed pipes", 5 * time.Second, false, 0},
+		{"failed parent", 5 * time.Second, false, 7},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			pidfile := filepath.Join(root, "child.pid")
+			gate := filepath.Join(root, "gate")
+			marker := filepath.Join(root, "survived")
+			child := `from pathlib import Path; import os,sys,time
+Path(sys.argv[1]).write_text(str(os.getpid()))
+end = time.monotonic() + 20
+while not Path(sys.argv[2]).exists() and time.monotonic() < end: time.sleep(.01)
+if Path(sys.argv[2]).exists(): Path(sys.argv[3]).write_text('survived')
+`
+			parent := `from pathlib import Path; import subprocess,sys,time
+kwargs = {} if sys.argv[5] == 'true' else dict(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+subprocess.Popen([sys.executable, '-c', sys.argv[1], *sys.argv[2:5]], **kwargs)
+while not Path(sys.argv[2]).exists(): time.sleep(.01)
+sys.exit(int(sys.argv[6]))
+`
+			started := time.Now()
+			result, err := runCommandWithLimits([]string{"python3", "-c", parent, child, pidfile, gate, marker, strconv.FormatBool(test.pipes), strconv.Itoa(test.exit)}, root, nil, commandLimits{timeout: test.timeout, outputLimit: 128})
+			if elapsed := time.Since(started); elapsed > 3*time.Second {
+				t.Errorf("command took %s, want bounded pipe wait", elapsed)
+			}
+			if (err != nil) != (test.pipes || test.exit != 0) {
+				t.Errorf("result = %#v, err = %v", result, err)
+			}
+			pid := readProcessPID(t, pidfile)
+			t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
+			requireProcessStopped(t, pid)
+			writeFile(t, gate, "open")
+			if _, err := os.Stat(marker); !os.IsNotExist(err) {
+				t.Fatalf("descendant executed after command returned: %v", err)
+			}
+		})
+	}
+}
+
+func readProcessPID(t *testing.T, path string) int {
+	t.Helper()
+	pid, err := strconv.Atoi(strings.TrimSpace(mustReadFile(t, path)))
+	if err != nil || pid <= 0 {
+		t.Fatalf("invalid PID in %s: %d, %v", path, pid, err)
+	}
+	return pid
+}
+
+func requireProcessStopped(t *testing.T, pid int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) {
+			return
+		}
+		// Orphans may remain zombies until the orb's PID 1 reaps them. A
+		// zombie cannot execute; kill(pid, 0) alone would report it as alive.
+		if runtime.GOOS == "linux" {
+			data, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+			if os.IsNotExist(err) {
+				return
+			}
+			if err == nil {
+				_, state, ok := strings.Cut(string(data), ") ")
+				if ok && strings.HasPrefix(state, "Z ") {
+					return
+				}
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("process %d is still running after cleanup", pid)
 }

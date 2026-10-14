@@ -417,4 +417,9 @@ when it is inactive. Failed candidates are not made current.
 Git, environment creation, package installation, preflight, and verification
 subprocesses each have a fixed 15-minute timeout. Pin retains at most the most
 recent 1 MiB from each output stream, marking truncated output in diagnostics.
-These limits do not apply to `pin run`, which remains an interactive process.
+On Unix, Pin terminates remaining processes in a subprocess's process group
+when it finishes, including after a successful parent exit. These subprocesses
+must not leave background services running. Interrupting activation cancels and
+waits for verification cleanup before restoring release links. Windows
+cancellation terminates only the direct child. These limits and cleanup do not
+apply to `pin run`, which remains an interactive process.

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/BurntSushi/toml"
 )
@@ -113,6 +114,20 @@ func renderInitConfig(opts initOptions, sourcePath string) (string, error) {
 	if name == "" {
 		name = filepath.Base(sourcePath)
 	}
+	// Validate before parsing commands or normalizing paths: those operations
+	// can replace or discard invalid bytes rather than preserve the input.
+	for key, values := range map[string][]string{
+		"name": {name}, "entrypoint": {opts.entrypoint}, "source": {opts.source},
+		"requirements": {opts.requirements}, "inject": opts.inject,
+		"branch": {opts.branch}, "remote": {opts.remote},
+		"preflight": opts.preflight, "verify": opts.verify,
+	} {
+		for _, value := range values {
+			if !utf8.ValidString(value) {
+				return "", fmt.Errorf("%s key %q must be valid UTF-8", configName, key)
+			}
+		}
+	}
 	name, err := validatePathSegment(name, "pin.toml key \"name\"")
 	if err != nil {
 		return "", err
@@ -149,6 +164,9 @@ func renderInitConfig(opts initOptions, sourcePath string) (string, error) {
 	branch := opts.branch
 	if branch == "" {
 		branch = currentBranchOrDefault(sourcePath)
+	}
+	if !utf8.ValidString(branch) {
+		return "", fmt.Errorf("%s key %q must be valid UTF-8", configName, "branch")
 	}
 	remote := opts.remote
 	if remote == "" {

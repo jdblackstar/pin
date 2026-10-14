@@ -2,11 +2,13 @@ package app
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 )
@@ -101,8 +103,15 @@ func installedToolNames(opts globalOptions) ([]string, error) {
 		if !entry.IsDir() {
 			continue
 		}
-		metadata, err := readMetadataForTool(opts.pinHome, entry.Name())
-		if err == nil && metadata != nil {
+		candidate, err := installedLayoutExists(pinContext{name: entry.Name(), pinHome: opts.pinHome})
+		if err != nil {
+			// The namespaced home contains only PIN installations. Preserve a
+			// damaged or inaccessible candidate so --all can report it without
+			// preventing healthy tools from being processed.
+			names[entry.Name()] = true
+			continue
+		}
+		if candidate {
 			names[entry.Name()] = true
 		}
 	}
@@ -117,7 +126,7 @@ func installedToolNames(opts globalOptions) ([]string, error) {
 				continue
 			}
 			ctx := pinContext{name: entry.Name(), pinHome: opts.legacyPinHome}
-			if _, ok, err := legacyMetadata(ctx); err == nil && ok {
+			if legacyReleaseEvidenceExists(ctx) {
 				names[entry.Name()] = true
 			}
 		}
@@ -131,6 +140,44 @@ func installedToolNames(opts globalOptions) ([]string, error) {
 	return result, nil
 }
 
+// Discover installation layout, not healthy metadata. Broken candidates must
+// reach the per-tool checks, but empty and unrelated directories are ignored.
+func installedLayoutExists(ctx pinContext) (bool, error) {
+	for _, name := range []string{"releases", "current", "previous"} {
+		if _, err := os.Lstat(filepath.Join(ctx.toolRoot(), name)); err == nil {
+			return true, nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return false, err
+		}
+	}
+	return false, nil
+}
+
+// The legacy home is shared with other applications. Require PIN's .pin
+// evidence, even if its metadata is damaged or there is no current link.
+func legacyReleaseEvidenceExists(ctx pinContext) bool {
+	info, err := os.Stat(ctx.releasesDir())
+	if err != nil || !info.IsDir() {
+		// Without readable PIN evidence, inaccessible entries and unrelated
+		// dangling or looping links cannot safely be attributed to PIN.
+		return false
+	}
+	releases, err := os.ReadDir(ctx.releasesDir())
+	if err != nil {
+		return false
+	}
+	for _, release := range releases {
+		if !release.IsDir() {
+			continue
+		}
+		if _, err := os.Lstat(filepath.Join(ctx.releasesDir(), release.Name(), metadataDir)); err == nil {
+			return true
+		}
+		// A damaged release must not hide readable evidence in another release.
+	}
+	return false
+}
+
 func (a app) commandVerifyAll(opts globalOptions) error {
 	names, err := installedToolNames(opts)
 	if err != nil {
@@ -141,7 +188,7 @@ func (a app) commandVerifyAll(opts globalOptions) error {
 		ctx, err := resolveToolContext(name, opts)
 		var metadata releaseMetadata
 		if err == nil {
-			metadata, err = verifyActive(ctx, fullIntegrityCheck)
+			metadata, err = verifyActive(context.Background(), ctx, fullIntegrityCheck)
 		}
 		if err != nil {
 			failed++
@@ -246,6 +293,10 @@ func (a app) commandUpdateAll(opts globalOptions, yes bool) error {
 	for _, candidate := range planned {
 		report, err := updateRelease(candidate.ctx)
 		if err != nil {
+			var exit exitError
+			if errors.As(err, &exit) && (exit.code == 130 || exit.code == 143) {
+				return err
+			}
 			failed++
 			fmt.Fprintf(a.stderr, "failed: %s: %v\n", candidate.ctx.name, err)
 			continue

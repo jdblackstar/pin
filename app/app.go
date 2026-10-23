@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -361,7 +362,7 @@ func resolveInjectedPaths(ctx pinContext, inject []string) []string {
 }
 
 func (a app) commandVerify(ctx pinContext) error {
-	metadata, err := verifyActive(ctx, fullIntegrityCheck)
+	metadata, err := verifyActive(context.Background(), ctx, fullIntegrityCheck)
 	if err != nil {
 		return err
 	}
@@ -478,7 +479,10 @@ func (a app) commandList(opts globalOptions) error {
 	for _, name := range names {
 		ctx, metadata, err := resolveToolInstall(name, opts)
 		if err != nil {
-			return err
+			// list historically omitted installs whose metadata could not be
+			// read. Broader --all discovery must not make one damaged candidate
+			// hide healthy installations.
+			continue
 		}
 		if metadata == nil {
 			continue

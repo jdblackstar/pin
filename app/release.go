@@ -344,6 +344,11 @@ var errNotRegularFile = errors.New("not a regular file")
 func openRegularFile(path string) (*os.File, error) {
 	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
+		// Opening a Unix socket fails (ENXIO) before the descriptor can be
+		// checked, so classify the path instead of surfacing the open error.
+		if info, statErr := os.Stat(path); statErr == nil && !info.Mode().IsRegular() {
+			return nil, &os.PathError{Op: "open", Path: path, Err: errNotRegularFile}
+		}
 		return nil, err
 	}
 	info, err := file.Stat()
@@ -455,7 +460,7 @@ func updateRelease(ctx pinContext) (updateReport, error) {
 	if !sameConfig(*config, *selectedConfig) {
 		return updateReport{}, fmt.Errorf("source %s changed while selecting release %s; retry the update", configName, sha)
 	}
-	if err := runConfiguredCommands(selectedConfig.preflight, selectedConfig.sourcePath, nil); err != nil {
+	if err := runConfiguredCommands(context.Background(), selectedConfig.preflight, selectedConfig.sourcePath, nil); err != nil {
 		return updateReport{}, err
 	}
 	release, err := ensureRelease(ctx, *selectedConfig, sha)
@@ -465,7 +470,7 @@ func updateRelease(ctx pinContext) (updateReport, error) {
 
 	if err := runSteps(
 		// ensureRelease just built or fully rechecked this release.
-		releaseStep{"verify release", func() error { return verifyRelease(ctx, release, false, cachedIntegrityCheck) }},
+		releaseStep{"verify release", func() error { return verifyRelease(context.Background(), ctx, release, false, cachedIntegrityCheck) }},
 	); err != nil {
 		return updateReport{}, err
 	}
@@ -498,7 +503,9 @@ func rollbackRelease(ctx pinContext) (rollbackReport, error) {
 	previousSHA := filepath.Base(previousTarget)
 
 	if err := runSteps(
-		releaseStep{"verify previous release", func() error { return verifyRelease(ctx, previousTarget, false, fullIntegrityCheck) }},
+		releaseStep{"verify previous release", func() error {
+			return verifyRelease(context.Background(), ctx, previousTarget, false, fullIntegrityCheck)
+		}},
 	); err != nil {
 		return rollbackReport{}, err
 	}
@@ -718,7 +725,7 @@ func extractGitArchive(repo, sha, destination string) error {
 	defer cancel()
 
 	archive := exec.CommandContext(ctx, "git", "archive", "--format=tar", sha)
-	configureProcessTree(archive)
+	defer configureProcessTree(archive)()
 	archive.WaitDelay = releaseCommandWaitDelay
 	archive.Dir = repo
 	pipeReader, pipeWriter, err := os.Pipe()
@@ -732,7 +739,7 @@ func extractGitArchive(repo, sha, destination string) error {
 	archive.Stderr = archiveStderr
 
 	extract := exec.CommandContext(ctx, "tar", "-xf", "-", "-C", destination)
-	configureProcessTree(extract)
+	defer configureProcessTree(extract)()
 	extract.WaitDelay = releaseCommandWaitDelay
 	extract.Stdin = pipeReader
 	extractStderr := newBoundedBuffer(defaultCommandLimits.outputLimit)
@@ -1152,12 +1159,12 @@ func pythonCommand() (string, error) {
 	return "", fmt.Errorf("python3 or python is required to build releases")
 }
 
-func verifyActive(ctx pinContext, precheck integrityCheck) (releaseMetadata, error) {
+func verifyActive(operation context.Context, ctx pinContext, precheck integrityCheck) (releaseMetadata, error) {
 	release, err := activeRelease(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if err := verifyRelease(ctx, release, true, precheck); err != nil {
+	if err := verifyRelease(operation, ctx, release, true, precheck); err != nil {
 		return nil, err
 	}
 	return readReleaseMetadata(release)
@@ -1167,7 +1174,7 @@ func verifyActive(ctx pinContext, precheck integrityCheck) (releaseMetadata, err
 // commands. precheck may be cachedIntegrityCheck only when the caller fully
 // checked this release earlier in the same command and no release code has run
 // since; the recheck after verify commands is always full.
-func verifyRelease(ctx pinContext, release string, expectActive bool, precheck integrityCheck) error {
+func verifyRelease(operation context.Context, ctx pinContext, release string, expectActive bool, precheck integrityCheck) error {
 	if err := requireDirectory(release, "release"); err != nil {
 		return err
 	}
@@ -1193,7 +1200,7 @@ func verifyRelease(ctx pinContext, release string, expectActive bool, precheck i
 			return requireActiveTarget(ctx, release)
 		}},
 		releaseStep{"run verify commands", func() error {
-			return runConfiguredCommands(config.verify, release, entrypointEnv(entrypoint))
+			return runConfiguredCommands(operation, config.verify, release, entrypointEnv(entrypoint))
 		}},
 		releaseStep{"recheck release integrity", func() error { return verifyReleaseIntegrity(release, *config, fullIntegrityCheck) }},
 	)
@@ -1456,9 +1463,9 @@ func prependPath(env []string, dir string) []string {
 	return updated
 }
 
-func runConfiguredCommands(commands [][]string, cwd string, env []string) error {
+func runConfiguredCommands(operation context.Context, commands [][]string, cwd string, env []string) error {
 	for _, command := range commands {
-		if _, err := runCommand(command, cwd, env); err != nil {
+		if _, err := runCommandContext(operation, command, cwd, env, defaultCommandLimits); err != nil {
 			return err
 		}
 	}
@@ -1527,12 +1534,12 @@ func activateAndVerifyRelease(ctx pinContext, sha, activationStep string) error 
 		return restoreErr
 	}
 
-	err = runWithSignalRestoration(restore, func() error {
+	err = runWithSignalRestoration(restore, func(operation context.Context) error {
 		return runSteps(
 			releaseStep{activationStep, func() error { return activateRelease(ctx, sha) }},
 			releaseStep{"verify active release", func() error {
 				// Activation follows a full recheck of this release.
-				_, err := verifyActive(ctx, cachedIntegrityCheck)
+				_, err := verifyActive(operation, ctx, cachedIntegrityCheck)
 				return err
 			}},
 		)
@@ -1546,15 +1553,27 @@ func activateAndVerifyRelease(ctx pinContext, sha, activationStep string) error 
 	return err
 }
 
-func runWithSignalRestoration(restore func() error, run func() error) error {
+func runWithSignalRestoration(restore func() error, run func(context.Context) error) error {
+	return runWithSignalRestorationSignals(restore, run, signal.Notify, signal.Stop)
+}
+
+func runWithSignalRestorationSignals(
+	restore func() error,
+	run func(context.Context) error,
+	notify func(chan<- os.Signal, ...os.Signal),
+	stop func(chan<- os.Signal),
+) error {
+	operation, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	signals := make(chan os.Signal, 1)
 	done := make(chan struct{})
 	handlerDone := make(chan struct{})
-	signal.Notify(signals, activationSignals()...)
+	notify(signals, activationSignals()...)
 
+	var interrupted os.Signal
 	handleSignal := func(received os.Signal) {
-		_ = restore()
-		os.Exit(exitCodeForSignal(received))
+		interrupted = received
+		cancel()
 	}
 	go func() {
 		defer close(handlerDone)
@@ -1562,8 +1581,8 @@ func runWithSignalRestoration(restore func() error, run func() error) error {
 		case received := <-signals:
 			handleSignal(received)
 		case <-done:
-			// Prefer a signal already queued before signal.Stop completed over
-			// normal shutdown of the handler.
+			// Prefer a signal already queued when run finished over normal
+			// shutdown of the handler.
 			select {
 			case received := <-signals:
 				handleSignal(received)
@@ -1572,10 +1591,30 @@ func runWithSignalRestoration(restore func() error, run func() error) error {
 		}
 	}()
 
-	err := run()
-	signal.Stop(signals)
+	err := run(operation)
 	close(done)
 	<-handlerDone
+	if interrupted != nil {
+		// Keep interception active through restoration once the handler owns
+		// the signal; stopping first would restore the process default action.
+		restored := errors.Join(exitError{code: exitCodeForSignal(interrupted)}, restore())
+		stop(signals)
+		return restored
+	}
+	// Stop signal delivery synchronously, then account for a signal queued
+	// after the handler chose done.
+	stop(signals)
+	select {
+	case received := <-signals:
+		handleSignal(received)
+	default:
+	}
+	if interrupted != nil {
+		// Wait for verification and its process-group cleanup before restoring
+		// links and releasing the tool lock. The caller preserves the signal's
+		// exit code while unwinding normally.
+		return errors.Join(exitError{code: exitCodeForSignal(interrupted)}, restore())
+	}
 	return err
 }
 
@@ -1779,6 +1818,10 @@ func runCommand(args []string, cwd string, env []string) (commandResult, error) 
 
 // runCommandWithLimits executes a subprocess with bounded runtime and captured output.
 func runCommandWithLimits(args []string, cwd string, env []string, limits commandLimits) (commandResult, error) {
+	return runCommandContext(context.Background(), args, cwd, env, limits)
+}
+
+func runCommandContext(operation context.Context, args []string, cwd string, env []string, limits commandLimits) (commandResult, error) {
 	if len(args) == 0 {
 		return commandResult{}, fmt.Errorf("empty command")
 	}
@@ -1788,10 +1831,10 @@ func runCommandWithLimits(args []string, cwd string, env []string, limits comman
 			commandArgs[0] = resolved
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), limits.timeout)
+	ctx, cancel := context.WithTimeout(operation, limits.timeout)
 	defer cancel()
 	command := exec.CommandContext(ctx, commandArgs[0], commandArgs[1:]...)
-	configureProcessTree(command)
+	defer configureProcessTree(command)()
 	command.WaitDelay = releaseCommandWaitDelay
 	command.Dir = cwd
 	if env != nil {

@@ -628,6 +628,115 @@ func TestVerifyCheckAndUpdateAll(t *testing.T) {
 	requireReleaseLinkForTool(t, root, "alpha", "current", alphaNewSHA)
 }
 
+func TestAllCommandsReportDamagedInstalls(t *testing.T) {
+	for _, layout := range []string{"namespaced", "legacy"} {
+		t.Run(layout, func(t *testing.T) {
+			root := t.TempDir()
+			pinHome := filepath.Join(root, "share")
+			if layout == "legacy" {
+				pinHome = filepath.Join(root, ".local", "share")
+			}
+			alphaRepo, alphaSHA := namedSourceRepo(t, filepath.Join(root, "alpha-source"), "alpha")
+			betaRepo, _ := namedSourceRepo(t, filepath.Join(root, "beta-source"), "beta")
+			for _, repo := range []string{alphaRepo, betaRepo} {
+				requireCode(t, runPinWithPinHome(t, root, pinHome, "update", repo), 0)
+			}
+			runner := runPin
+			if layout == "legacy" {
+				runner = runPinWithHome
+			}
+			current := filepath.Join(pinHome, "alpha", "current")
+			metadata := filepath.Join(pinHome, "alpha", "releases", alphaSHA, metadataDir, metadataName)
+			originalMetadata := mustReadFile(t, metadata)
+			originalLink, err := os.Readlink(current)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, damage := range []string{"missing metadata", "malformed metadata", "missing current", "dangling current", "file current", "directory current", "missing both"} {
+				t.Run(damage, func(t *testing.T) {
+					t.Cleanup(func() {
+						if err := os.RemoveAll(current); err != nil {
+							t.Fatal(err)
+						}
+						if err := os.Symlink(originalLink, current); err != nil {
+							t.Fatal(err)
+						}
+						writeFile(t, metadata, originalMetadata)
+					})
+					if damage == "missing metadata" || damage == "missing both" {
+						if err := os.Remove(metadata); err != nil {
+							t.Fatal(err)
+						}
+					} else if damage == "malformed metadata" {
+						writeFile(t, metadata, "{")
+					}
+					if strings.Contains(damage, "current") || damage == "missing both" {
+						if err := os.Remove(current); err != nil {
+							t.Fatal(err)
+						}
+						switch damage {
+						case "dangling current":
+							if err := os.Symlink("releases/missing", current); err != nil {
+								t.Fatal(err)
+							}
+						case "file current":
+							writeFile(t, current, "not a link")
+						case "directory current":
+							if err := os.Mkdir(current, 0o755); err != nil {
+								t.Fatal(err)
+							}
+						}
+					}
+					for _, command := range []struct{ name, summary string }{
+						{"verify", "summary: 1 passed, 1 failed"},
+						{"check", "summary: 1 current, 0 non-current, 1 failed"},
+						{"update", "summary: 0 updated, 1 failed"},
+					} {
+						requireCode(t, runner(t, root, command.name, "alpha"), 2)
+						result := runner(t, root, command.name, "--all")
+						requireCode(t, result, 1)
+						requireContains(t, result.stderr, "failed: alpha:")
+						requireContains(t, result.stdout, command.summary)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestAllCommandsFailWhenEveryInstallIsDamaged(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "share", "broken", "current"), "not a symlink")
+	for _, command := range []string{"verify", "check", "update"} {
+		result := runPin(t, root, command, "--all")
+		requireCode(t, result, 1)
+		requireContains(t, result.stderr, "failed: broken:")
+		requireContains(t, result.stdout, "1 failed")
+	}
+}
+
+func TestInstalledToolNamesIgnoresUnrelatedLegacyLayouts(t *testing.T) {
+	root := t.TempDir()
+	opts := globalOptions{pinHome: filepath.Join(root, "pin"), legacyPinHome: filepath.Join(root, "share")}
+	for _, path := range []string{
+		filepath.Join(opts.pinHome, "orphaned"),
+		filepath.Join(opts.pinHome, "alpha", "releases"),
+		filepath.Join(opts.legacyPinHome, "beta", "releases", "revision", metadataDir),
+		filepath.Join(opts.legacyPinHome, "unrelated", "releases", "revision"),
+	} {
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink("releases/revision", filepath.Join(opts.legacyPinHome, "unrelated", "current")); err != nil {
+		t.Fatal(err)
+	}
+	names, err := installedToolNames(opts)
+	if err != nil || strings.Join(names, ",") != "alpha,beta" {
+		t.Fatalf("installed names = %v, err = %v; want alpha,beta", names, err)
+	}
+}
+
 func TestUpdateAllCancellationSummarizesPrecheckFailures(t *testing.T) {
 	root := t.TempDir()
 	alphaRepo, _ := namedSourceRepo(t, filepath.Join(root, "alpha-source"), "alpha")

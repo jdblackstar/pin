@@ -344,6 +344,11 @@ var errNotRegularFile = errors.New("not a regular file")
 func openRegularFile(path string) (*os.File, error) {
 	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
+		// Opening a Unix socket fails (ENXIO) before the descriptor can be
+		// checked, so classify the path instead of surfacing the open error.
+		if info, statErr := os.Stat(path); statErr == nil && !info.Mode().IsRegular() {
+			return nil, &os.PathError{Op: "open", Path: path, Err: errNotRegularFile}
+		}
 		return nil, err
 	}
 	info, err := file.Stat()

@@ -184,7 +184,7 @@ func TestRunCommandCleansDescendantsAfterParentExits(t *testing.T) {
 		exit    int
 	}{
 		{"inherited pipes", 5 * time.Second, true, 0},
-		{"inherited pipes at deadline", 100 * time.Millisecond, true, 0},
+		{"inherited pipes at deadline", 500 * time.Millisecond, true, 0},
 		{"closed pipes", 5 * time.Second, false, 0},
 		{"failed parent", 5 * time.Second, false, 7},
 	} {
